@@ -1,5 +1,7 @@
 package cn.junlaile.msg.stream.relay.multi.stomp;
 
+import cn.junlaile.msg.stream.relay.multi.rabbit.RabbitMQClientManager;
+import cn.junlaile.msg.stream.relay.multi.support.QueueMappingManager;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.json.JsonObject;
 import io.vertx.rabbitmq.RabbitMQConsumer;
@@ -13,13 +15,10 @@ import jakarta.websocket.OnOpen;
 import jakarta.websocket.Session;
 import jakarta.websocket.server.ServerEndpoint;
 import org.jboss.logging.Logger;
-import www.junlaile.cn.msg.stream.rabbit.RabbitMQClientManager;
-import www.junlaile.cn.msg.stream.support.QueueMappingManager;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -740,47 +739,42 @@ public class StompRelayEndpoint {
     private record QueuePlan(String queueName, boolean declare, boolean durable, boolean exclusive, boolean autoDelete) {}
 
     /**
-     * 目标地址类
-     * 表示 STOMP 消息的目标地址，可以是队列或交换机
-     */
-    private static final class Destination {
-        enum Type { QUEUE, EXCHANGE }
+         * 目标地址类
+         * 表示 STOMP 消息的目标地址，可以是队列或交换机
+         */
+        private record Destination(StompRelayEndpoint.Destination.Type type, String original, String queue, String exchange,
+                                   String routingKey) {
+            enum Type {QUEUE, EXCHANGE}
 
-        private final Type type;
-        private final String original;
-        private final String queue;
-        private final String exchange;
-        private final String routingKey;
-
-        private Destination(Type type, String original, String queue, String exchange, String routingKey) {
-            this.type = type;
-            this.original = original;
-            this.queue = queue;
-            this.exchange = exchange;
-            this.routingKey = Objects.requireNonNullElse(routingKey, "");
-        }
-
-        private static Destination forQueue(String original, String queue) {
-            return new Destination(Type.QUEUE, original, queue, null, "");
-        }
-
-        private static Destination forExchange(String original, String exchange, String routingKey) {
-            return new Destination(Type.EXCHANGE, original, null, exchange, routingKey);
-        }
-
-        private Destination withQueue(String queueName) {
-            if (type == Type.EXCHANGE) {
-                return new Destination(Type.EXCHANGE, original, queueName, exchange, routingKey);
+            private Destination(Type type, String original, String queue, String exchange, String routingKey) {
+                this.type = type;
+                this.original = original;
+                this.queue = queue;
+                this.exchange = exchange;
+                this.routingKey = Objects.requireNonNullElse(routingKey, "");
             }
-            return this;
-        }
 
-        private boolean isQueue() {
-            return type == Type.QUEUE;
-        }
+            private static Destination forQueue(String original, String queue) {
+                return new Destination(Type.QUEUE, original, queue, null, "");
+            }
 
-        private boolean isExchange() {
-            return type == Type.EXCHANGE;
+            private static Destination forExchange(String original, String exchange, String routingKey) {
+                return new Destination(Type.EXCHANGE, original, null, exchange, routingKey);
+            }
+
+            private Destination withQueue(String queueName) {
+                if (type == Type.EXCHANGE) {
+                    return new Destination(Type.EXCHANGE, original, queueName, exchange, routingKey);
+                }
+                return this;
+            }
+
+            private boolean isQueue() {
+                return type == Type.QUEUE;
+            }
+
+            private boolean isExchange() {
+                return type == Type.EXCHANGE;
+            }
         }
-    }
 }
