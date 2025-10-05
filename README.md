@@ -29,94 +29,29 @@
 
 ### 启动服务
 
-```bash
-# 开发模式（支持热重载）
-mvn quarkus:dev
+开发模式支持热重载，生产环境需要打包后运行。服务默认运行在端口 15674，提供 STOMP WebSocket 端点 `/ws` 和健康检查端点 `/api/health`。
 
-# 生产构建
-mvn clean package -DskipTests
-java -jar target/msg-stream-relay-multi-1.0-SNAPSHOT-runner.jar
-```
-
-服务启动后可访问：
-- **主服务**: http://localhost:15674
-- **STOMP WebSocket**: `/ws`
-- **健康检查**: `/api/health`
-
-### 验证服务状态
-
-```bash
-# 健康检查
-curl http://localhost:15674/api/health
-
-# 队列映射统计
-curl http://localhost:15674/api/queue-mapping/stats
-
-# 查看所有可用端点
-curl http://localhost:15674/q/dev
-```
+可使用 curl 命令验证服务状态或查看开发工具端点。
 
 ## 配置
 
-### 基础配置 (application.properties)
+### 配置说明
 
-```properties
-# HTTP 服务端口
-quarkus.http.port=15674
-
-# RabbitMQ 连接配置
-relay.rabbitmq.host=localhost
-relay.rabbitmq.port=5672
-relay.rabbitmq.username=admin
-relay.rabbitmq.password=password
-relay.rabbitmq.virtual-host=/
-relay.rabbitmq.connection-timeout=60000
-relay.rabbitmq.automatic-recovery-enabled=true
-
-# AMQP 1.0 端点配置
-relay.amqp.enabled=true
-relay.amqp.host=0.0.0.0
-relay.amqp.port=5673
-
-# 开发配置
-%dev.quarkus.log.level=DEBUG
-%dev.quarkus.rabbitmq.devservices.enabled=false
-```
-
-### 环境变量支持
-
-```bash
-# 使用环境变量覆盖配置
-export QUARKUS_HTTP_PORT=8080
-export RELAY_RABBITMQ_HOST=rabbitmq.example.com
-export RELAY_RABBITMQ_USERNAME=relay_user
-export RELAY_RABBITMQ_PASSWORD=secure_password
-```
+主要配置包括 HTTP 端口（默认 15674）、RabbitMQ 连接参数和 AMQP 1.0 端点设置。支持环境变量覆盖配置，配置项使用 `relay.` 前缀。
 
 ## 目标地址格式
 
-### 队列格式
-```javascript
-/queue/queue-name
-```
+### 目标地址格式
 
-### 交换机格式
-```javascript
-/exchange/exchange-name/routing-key
-```
+- **队列**: `/queue/queue-name`
+- **交换机**: `/exchange/exchange-name/routing-key`
 
 ## 队列模式
 
-### 广播模式（默认）
-每个客户端独立队列，所有客户端都收到消息。
+### 队列模式
 
-### 共享模式
-多个客户端共享队列，消息负载均衡分发：
-```javascript
-client.subscribe('/exchange/tasks/process', handler, {
-    'x-queue-mode': 'shared'
-});
-```
+- **广播模式（默认）**: 每个客户端独立队列，所有客户端都收到消息
+- **共享模式**: 多个客户端共享队列，消息负载均衡分发，通过自定义头部 `x-queue-mode: shared` 启用
 
 ## API 端点
 
@@ -138,82 +73,15 @@ client.subscribe('/exchange/tasks/process', handler, {
 |------|------|------|------|
 | AMQP 1.0 | AMQP 1.0 | 5673 | 原生 AMQP 1.0 协议支持 |
 
-## 使用示例
+## 客户端连接
 
-### JavaScript 客户端 (STOMP over WebSocket)
-
-```javascript
-// 连接到 STOMP WebSocket
-const socket = new SockJS('http://localhost:15674/ws');
-const stompClient = Stomp.over(socket);
-
-stompClient.connect({}, function (frame) {
-    console.log('Connected: ' + frame);
-
-    // 订阅队列
-    stompClient.subscribe('/queue/test-queue', function (message) {
-        console.log('Received message:', JSON.parse(message.body));
-    });
-
-    // 发送消息
-    stompClient.send('/queue/test-queue', {}, JSON.stringify({
-        content: 'Hello from client!',
-        timestamp: new Date().toISOString()
-    }));
-});
-```
-
-### Java 客户端 (AMQP 1.0)
-
-```java
-// 使用 Qpid JMS 客户端连接 AMQP 1.0 端点
-JmsConnectionFactory factory = new JmsConnectionFactory("amqp://localhost:5673");
-Connection connection = factory.createConnection("admin", "password");
-Session session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
-
-// 发送消息
-Queue queue = session.createQueue("test-queue");
-MessageProducer producer = session.createProducer(queue);
-TextMessage message = session.createTextMessage("Hello from AMQP 1.0 client!");
-producer.send(message);
-```
+支持 STOMP over WebSocket 客户端（如 JavaScript SockJS + STOMP.js）和 AMQP 1.0 客户端（如 Qpid JMS）连接。客户端可进行消息订阅和发送，支持动态队列创建和绑定。
 
 ## 开发指南
 
-### 构建和测试
+### 开发说明
 
-```bash
-# 编译项目
-mvn clean compile
-
-# 运行单元测试
-mvn clean test
-
-# 运行集成测试
-mvn clean verify
-
-# 打包应用
-mvn clean package
-
-# 跳过测试打包（生产环境）
-mvn clean package -DskipTests
-
-# 生成本地文档
-mvn javadoc:javadoc
-```
-
-### 开发工具
-
-```bash
-# 启动开发模式（热重载）
-mvn quarkus:dev
-
-# 启动调试模式
-mvn quarkus:dev -Ddebug=5005
-
-# 查看应用信息
-curl http://localhost:15674/q/dev-ui
-```
+使用 Maven 进行项目管理，支持编译、测试、打包等标准操作。开发模式提供热重载功能，可启用调试端口（默认 5005）。Quarkus 开发工具提供应用信息查看和监控功能。
 
 ## 项目结构
 
@@ -267,42 +135,9 @@ src/main/java/cn/junlaile/msg/stream/relay/multi/
 
 ## 部署建议
 
-### Docker 部署
+### 部署方式
 
-```dockerfile
-FROM fabric8/java-alpine-openjdk21:latest
-COPY target/msg-stream-relay-multi-1.0-SNAPSHOT-runner.jar /deployments/app.jar
-EXPOSE 15674 5673
-CMD ["java", "-jar", "/deployments/app.jar"]
-```
-
-### Kubernetes 部署
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: msg-stream-relay
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: msg-stream-relay
-  template:
-    metadata:
-      labels:
-        app: msg-stream-relay
-    spec:
-      containers:
-      - name: relay
-        image: msg-stream-relay:latest
-        ports:
-        - containerPort: 15674
-        - containerPort: 5673
-        env:
-        - name: RELAY_RABBITMQ_HOST
-          value: "rabbitmq-service"
-```
+支持传统部署、容器化部署（Docker）和 Kubernetes 部署。需要暴露端口 15674（HTTP/WebSocket）和 5673（AMQP 1.0）。在容器化环境中可通过环境变量配置 RabbitMQ 连接参数。
 
 ---
 

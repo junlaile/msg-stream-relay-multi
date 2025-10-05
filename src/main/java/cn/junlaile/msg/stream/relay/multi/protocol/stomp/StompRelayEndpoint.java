@@ -719,7 +719,7 @@ public class StompRelayEndpoint {
      * @param frame STOMP 帧
      */
     private void parseCustomHeaders(RelaySession state, StompFrame frame) {
-        if (frame.headers() == null || frame.headers().isEmpty()) {
+        if (frame.headers().isEmpty()) {
             return;
         }
 
