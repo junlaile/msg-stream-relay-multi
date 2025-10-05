@@ -14,7 +14,6 @@
         <quarkus.platform.version>3.28.1</quarkus.platform.version>
         <quarkus-plugin.version>3.28.1</quarkus-plugin.version>
         <surefire-plugin.version>3.5.4</surefire-plugin.version>
-        <io.nats.version>2.23.0</io.nats.version>
         <org.mockito.mockito-core.version>5.20.0</org.mockito.mockito-core.version>
     </properties>
 
