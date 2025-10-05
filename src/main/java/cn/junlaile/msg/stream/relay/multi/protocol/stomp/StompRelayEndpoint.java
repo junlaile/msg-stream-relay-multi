@@ -139,6 +139,8 @@ public class StompRelayEndpoint {
             case "SUBSCRIBE" -> handleSubscribe(state, frame);
             case "UNSUBSCRIBE" -> handleUnsubscribe(state, frame);
             case "SEND" -> handleSend(state, frame);
+            case "ACK" -> handleAck(state, frame);
+            case "NACK" -> handleNack(state, frame);
             case "DISCONNECT" -> handleDisconnect(state, frame);
             default -> sendError(state, "unsupported-command", "Command " + frame.command() + " is not supported");
         }
@@ -146,12 +148,16 @@ public class StompRelayEndpoint {
 
     /**
      * 处理 CONNECT/STOMP 命令
-     * 建立与 RabbitMQ 的连接并向客户端发送 CONNECTED 帧
+     * 解析自定义请求头，建立与 RabbitMQ 的连接并向客户端发送 CONNECTED 帧
      *
      * @param state 中继会话状态对象
      * @param frame CONNECT 或 STOMP 命令帧
      */
     private void handleConnect(RelaySession state, StompFrame frame) {
+        // 解析自定义请求头
+        parseCustomHeaders(state, frame);
+
+        // 建立RabbitMQ连接
         clientManager.ensureConnected().whenComplete((ignored, err) -> {
             if (err != null) {
                 LOG.error("RabbitMQ connection failed", err);
@@ -166,6 +172,7 @@ public class StompRelayEndpoint {
             headers.put("server", "quarkus-web-stomp-relay");
             sendFrame(state.session, "CONNECTED", headers, "");
             sendReceiptIfRequested(state, frame);
+            LOG.infof("Successfully connected session %s", state.session.getId());
         });
     }
 
@@ -386,6 +393,64 @@ public class StompRelayEndpoint {
     }
 
     /**
+     * 处理 ACK 命令
+     * 客户端确认消费消息，记录消费确认日志
+     *
+     * @param state 中继会话状态对象
+     * @param frame ACK 命令帧，包含 subscription 和 message-id 头部
+     */
+    private void handleAck(RelaySession state, StompFrame frame) {
+        if (!state.connected) {
+            LOG.warnf("Received ACK frame from non-connected session %s", state.session.getId());
+            return;
+        }
+
+        String subscriptionId = frame.header("subscription");
+        String messageId = frame.header("message-id");
+
+        if (subscriptionId == null || messageId == null) {
+            LOG.warnf("Received ACK frame without required headers - Session: %s, Subscription: %s, MessageId: %s",
+                    state.session.getId(), subscriptionId, messageId);
+            return;
+        }
+
+        // 记录前端确认消费的日志
+        LOG.infof("Frontend acknowledged message - Session: %s, Subscription: %s, MessageId: %s",
+                state.session.getId(), subscriptionId, messageId);
+
+        sendReceiptIfRequested(state, frame);
+    }
+
+    /**
+     * 处理 NACK 命令
+     * 客户端拒绝消费消息，记录拒绝日志
+     *
+     * @param state 中继会话状态对象
+     * @param frame NACK 命令帧，包含 subscription 和 message-id 头部
+     */
+    private void handleNack(RelaySession state, StompFrame frame) {
+        if (!state.connected) {
+            LOG.warnf("Received NACK frame from non-connected session %s", state.session.getId());
+            return;
+        }
+
+        String subscriptionId = frame.header("subscription");
+        String messageId = frame.header("message-id");
+
+        if (subscriptionId == null || messageId == null) {
+            LOG.warnf("Received NACK frame without required headers - Session: %s, Subscription: %s, MessageId: %s",
+                    state.session.getId(), subscriptionId, messageId);
+            return;
+        }
+
+        // 记录前端拒绝消费的日志
+        LOG.warnf("Frontend rejected message - Session: %s, Subscription: %s, MessageId: %s",
+                state.session.getId(), subscriptionId, messageId);
+
+        sendReceiptIfRequested(state, frame);
+    }
+
+    /**
      * 处理 DISCONNECT 命令
      * 断开客户端连接并清理资源
      *
@@ -411,15 +476,22 @@ public class StompRelayEndpoint {
             return;
         }
         String body = MessageConverter.toString(message.body());
+        String messageId = subscriptionId + "-" + MESSAGE_SEQUENCE.incrementAndGet();
         Map<String, String> headers = new LinkedHashMap<>();
         headers.put("subscription", subscriptionId);
-        headers.put("message-id", subscriptionId + "-" + MESSAGE_SEQUENCE.incrementAndGet());
+        headers.put("message-id", messageId);
         headers.put("destination", destination);
         if (message.properties() instanceof JsonObject properties && properties.containsKey("contentType")) {
             headers.put("content-type", properties.getString("contentType"));
         } else {
             headers.put("content-type", "text/plain");
         }
+
+        // 记录发送给前端的消息数据
+        LOG.infof("Forwarding message to frontend - Session: %s, Subscription: %s, Destination: %s, MessageId: %s, Content: %s",
+                state.session.getId(), subscriptionId, destination, messageId,
+                body.length() > 200 ? body.substring(0, 200) + "..." : body);
+
         sendFrame(state.session, "MESSAGE", headers, body);
     }
 
@@ -640,14 +712,80 @@ public class StompRelayEndpoint {
     }
 
     /**
+     * 解析自定义请求头
+     * 提取客户端发送的自定义头部信息并存储在会话中
+     *
+     * @param state 中继会话状态对象
+     * @param frame STOMP 帧
+     */
+    private void parseCustomHeaders(RelaySession state, StompFrame frame) {
+        if (frame.headers() == null || frame.headers().isEmpty()) {
+            return;
+        }
+
+        // 定义标准STOMP头部，这些头部不被视为自定义头部
+        Set<String> standardHeaders = Set.of(
+            "accept-version", "host", "login", "passcode", "heart-beat",
+            "session", "destination", "id", "ack", "receipt", "transaction",
+            "content-length", "content-type"
+        );
+
+        // 遍历所有头部，提取自定义头部
+        for (Map.Entry<String, String> entry : frame.headers().entrySet()) {
+            String headerName = entry.getKey().toLowerCase();
+
+            // 跳过标准STOMP头部
+            if (!standardHeaders.contains(headerName)) {
+                String headerValue = entry.getValue();
+                state.customHeaders.put(entry.getKey(), headerValue);
+
+                // 特殊处理auth头部，打印其值
+                if ("auth".equals(headerName)) {
+                    LOG.infof("Found auth header value: '%s' for session %s", headerValue, state.session.getId());
+                }
+                // 记录其他自定义头部（注意：不要记录敏感信息）
+                else if (isSafeToLog(headerName)) {
+                    LOG.debugf("Parsed custom header '%s': '%s' for session %s",
+                            entry.getKey(), headerValue, state.session.getId());
+                } else {
+                    LOG.debugf("Parsed sensitive custom header '%s': [REDACTED] for session %s",
+                            entry.getKey(), state.session.getId());
+                }
+            }
+        }
+
+        if (!state.customHeaders.isEmpty()) {
+            LOG.infof("Found %d custom headers for session %s",
+                    state.customHeaders.size(), state.session.getId());
+        }
+    }
+
+    /**
+     * 判断头部信息是否安全记录到日志中
+     * 避免记录敏感信息如密码、令牌等
+     *
+     * @param headerName 头部名称
+     * @return 如果安全则返回 true
+     */
+    private boolean isSafeToLog(String headerName) {
+        String lowerHeader = headerName.toLowerCase();
+        return !lowerHeader.contains("auth") &&
+               !lowerHeader.contains("token") &&
+               !lowerHeader.contains("password") &&
+               !lowerHeader.contains("secret") &&
+               !lowerHeader.contains("key");
+    }
+
+    /**
      * 中继会话类
-     * 封装单个 WebSocket 连接的状态信息，包括 STOMP 帧解码器、订阅管理和连接状态
+     * 封装单个 WebSocket 连接的状态信息，包括 STOMP 帧解码器、订阅管理、连接状态和自定义请求头
      */
     private static final class RelaySession {
         private final Session session;
         private final StompFrameDecoder decoder = new StompFrameDecoder();
         private final ConcurrentMap<String, Subscription> subscriptions = new ConcurrentHashMap<>();
         private volatile boolean connected;
+        private final Map<String, String> customHeaders = new ConcurrentHashMap<>();
 
         /**
          * 创建中继会话
