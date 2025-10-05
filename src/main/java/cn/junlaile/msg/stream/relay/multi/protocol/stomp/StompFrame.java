@@ -1,4 +1,4 @@
-package cn.junlaile.msg.stream.relay.multi.stomp;
+package cn.junlaile.msg.stream.relay.multi.protocol.stomp;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;

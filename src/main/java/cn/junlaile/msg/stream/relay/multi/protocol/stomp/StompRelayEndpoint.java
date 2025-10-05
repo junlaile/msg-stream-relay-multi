@@ -1,5 +1,8 @@
-package cn.junlaile.msg.stream.relay.multi.stomp;
+package cn.junlaile.msg.stream.relay.multi.protocol.stomp;
 
+import cn.junlaile.msg.stream.relay.multi.protocol.common.Destination;
+import cn.junlaile.msg.stream.relay.multi.protocol.common.DestinationParser;
+import cn.junlaile.msg.stream.relay.multi.protocol.common.MessageConverter;
 import cn.junlaile.msg.stream.relay.multi.rabbit.RabbitMQClientManager;
 import cn.junlaile.msg.stream.relay.multi.support.QueueMappingManager;
 import io.vertx.core.buffer.Buffer;
@@ -17,7 +20,6 @@ import jakarta.websocket.server.ServerEndpoint;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
@@ -179,12 +181,12 @@ public class StompRelayEndpoint {
             sendError(state, "not-connected", "CONNECT frame required before SUBSCRIBE");
             return;
         }
-        Destination destination = parseDestination(frame.header("destination"));
+        Destination destination = DestinationParser.parse(frame.header("destination"));
         if (destination == null) {
             sendError(state, "invalid-destination", "Supported destinations: /queue/<name> or /exchange/<exchange>/<binding>");
             return;
         }
-        final String subscriptionId = Objects.requireNonNullElse(frame.header("id"), destination.original);
+        final String subscriptionId = Objects.requireNonNullElse(frame.header("id"), destination.original());
         if (state.subscriptions.containsKey(subscriptionId)) {
             sendError(state, "duplicate-subscription", "Subscription id already in use: " + subscriptionId);
             return;
@@ -194,7 +196,7 @@ public class StompRelayEndpoint {
         CompletionStage<RabbitMQConsumer> stage;
         if (initialDestination.isQueue()) {
             stage = clientManager.ensureConnected()
-                    .thenCompose(ignored -> clientManager.createQueueConsumer(initialDestination.queue));
+                    .thenCompose(ignored -> clientManager.createQueueConsumer(initialDestination.queue()));
         } else {
             // 检查队列模式：broadcast（广播，每个客户端独立队列）或 shared（共享，负载均衡）
             String queueMode = frame.header("x-queue-mode");
@@ -207,17 +209,17 @@ public class StompRelayEndpoint {
             if (sharedQueue) {
                 // 共享模式：多个客户端共享同一队列（负载均衡）
                 mapping = queueMappingManager.resolveQueue(
-                    initialDestination.original,
-                    initialDestination.exchange,
-                    initialDestination.routingKey
+                    initialDestination.original(),
+                    initialDestination.exchange(),
+                    initialDestination.routingKey()
                 );
             } else {
                 // 广播模式（默认）：每个订阅独立队列（所有客户端都收到消息）
                 String uniqueKey = state.session.getId() + ":" + subscriptionId;
                 mapping = queueMappingManager.resolveQueue(
-                    initialDestination.original + ":" + uniqueKey,
-                    initialDestination.exchange,
-                    initialDestination.routingKey
+                    initialDestination.original() + ":" + uniqueKey,
+                    initialDestination.exchange(),
+                    initialDestination.routingKey()
                 );
             }
 
@@ -228,12 +230,12 @@ public class StompRelayEndpoint {
         Destination finalDestination = destination;
         stage.whenComplete((consumer, err) -> {
             if (err != null) {
-                LOG.errorf(err, "Failed to prepare subscription %s", finalDestination.original);
-                sendError(state, "subscription-failed", "Cannot subscribe to destination " + finalDestination.original + ": " + err.getMessage());
+                LOG.errorf(err, "Failed to prepare subscription %s", finalDestination.original());
+                sendError(state, "subscription-failed", "Cannot subscribe to destination " + finalDestination.original() + ": " + err.getMessage());
                 return;
             }
             consumer.exceptionHandler(t -> {
-                LOG.errorf(t, "Consumer error for subscription %s, queue %s", subscriptionId, finalDestination.queue);
+                LOG.errorf(t, "Consumer error for subscription %s, queue %s", subscriptionId, finalDestination.queue());
                 // 尝试重新创建消费者
                 if (state.session.isOpen() && state.subscriptions.containsKey(subscriptionId)) {
                     LOG.infof("Attempting to recover subscription %s", subscriptionId);
@@ -242,15 +244,15 @@ public class StompRelayEndpoint {
             });
             consumer.handler(msg -> {
                 try {
-                    forwardMessage(state, subscriptionId, finalDestination.original, msg);
+                    forwardMessage(state, subscriptionId, finalDestination.original(), msg);
                 } catch (Exception e) {
                     LOG.errorf(e, "Error forwarding message for subscription %s", subscriptionId);
                 }
             });
-            state.subscriptions.put(subscriptionId, new Subscription(consumer, finalDestination, finalDestination.queue));
+            state.subscriptions.put(subscriptionId, new Subscription(consumer, finalDestination, finalDestination.queue()));
 
             // 增加消费者计数
-            queueMappingManager.incrementConsumer(finalDestination.original);
+            queueMappingManager.incrementConsumer(finalDestination.original());
 
             sendReceiptIfRequested(state, frame);
         });
@@ -305,8 +307,8 @@ public class StompRelayEndpoint {
     private CompletionStage<Void> bindQueueToExchange(String queueName, Destination destination) {
         return clientManager.bindQueue(
             queueName,
-            destination.exchange,
-            destination.routingKey
+            destination.exchange(),
+            destination.routingKey()
         );
     }
 
@@ -344,7 +346,7 @@ public class StompRelayEndpoint {
         subscription.consumer.cancel();
 
         // 减少消费者计数
-        queueMappingManager.decrementConsumer(subscription.destination.original);
+        queueMappingManager.decrementConsumer(subscription.destination.original());
 
         sendReceiptIfRequested(state, frame);
     }
@@ -361,7 +363,7 @@ public class StompRelayEndpoint {
             sendError(state, "not-connected", "CONNECT frame required before SEND");
             return;
         }
-        Destination destination = parseDestination(frame.header("destination"));
+        Destination destination = DestinationParser.parse(frame.header("destination"));
         if (destination == null) {
             sendError(state, "invalid-destination", "Supported destinations: /queue/<name> or /exchange/<exchange>/<routing>");
             return;
@@ -369,14 +371,14 @@ public class StompRelayEndpoint {
         Buffer payload = Buffer.buffer(frame.body());
         CompletionStage<Void> publishStage = clientManager.ensureConnected().thenCompose(ignored -> {
             if (destination.isQueue()) {
-                return clientManager.publish("", destination.queue, payload);
+                return clientManager.publish("", destination.queue(), payload);
             }
-            return clientManager.publish(destination.exchange, destination.routingKey, payload);
+            return clientManager.publish(destination.exchange(), destination.routingKey(), payload);
         });
         publishStage.whenComplete((ignored, err) -> {
             if (err != null) {
-                LOG.errorf(err, "Failed to publish to %s", destination.original);
-                sendError(state, "publish-failed", "Cannot publish to destination " + destination.original + ": " + err.getMessage());
+                LOG.errorf(err, "Failed to publish to %s", destination.original());
+                sendError(state, "publish-failed", "Cannot publish to destination " + destination.original() + ": " + err.getMessage());
                 return;
             }
             sendReceiptIfRequested(state, frame);
@@ -408,9 +410,7 @@ public class StompRelayEndpoint {
         if (!state.session.isOpen()) {
             return;
         }
-        String body = Optional.ofNullable(message.body())
-                .map(buffer -> buffer.toString(StandardCharsets.UTF_8))
-                .orElse("");
+        String body = MessageConverter.toString(message.body());
         Map<String, String> headers = new LinkedHashMap<>();
         headers.put("subscription", subscriptionId);
         headers.put("message-id", subscriptionId + "-" + MESSAGE_SEQUENCE.incrementAndGet());
@@ -537,7 +537,7 @@ public class StompRelayEndpoint {
 
             consumer.handler(msg -> {
                 try {
-                    forwardMessage(state, subscriptionId, destination.original, msg);
+                    forwardMessage(state, subscriptionId, destination.original(), msg);
                 } catch (Exception e) {
                     LOG.errorf(e, "Error forwarding message for recovered subscription %s", subscriptionId);
                 }
@@ -554,44 +554,6 @@ public class StompRelayEndpoint {
             state.subscriptions.put(subscriptionId, new Subscription(consumer, destination, queueName));
             LOG.infof("Successfully recovered subscription %s", subscriptionId);
         });
-    }
-
-    /**
-     * 解析 STOMP 目标地址字符串
-     * 支持两种格式：/queue/name 和 /exchange/name/routingKey
-     *
-     * @param destination 目标地址字符串
-     * @return 解析后的 Destination 对象，如果格式无效则返回 null
-     */
-    private Destination parseDestination(String destination) {
-        if (destination == null || destination.isBlank()) {
-            return null;
-        }
-        if (destination.startsWith("/queue/")) {
-            String queue = destination.substring("/queue/".length());
-            return queue.isEmpty() ? null : Destination.forQueue(destination, queue);
-        }
-        if (destination.startsWith("/exchange/")) {
-            String remainder = destination.substring("/exchange/".length());
-            if (remainder.isEmpty()) {
-                return null;
-            }
-            int slashIndex = remainder.indexOf('/');
-            String exchange;
-            String routingKey;
-            if (slashIndex >= 0) {
-                exchange = remainder.substring(0, slashIndex);
-                routingKey = remainder.substring(slashIndex + 1);
-            } else {
-                exchange = remainder;
-                routingKey = "";
-            }
-            if (exchange.isEmpty()) {
-                return null;
-            }
-            return Destination.forExchange(destination, exchange, routingKey);
-        }
-        return null;
     }
 
     /**
@@ -616,7 +578,8 @@ public class StompRelayEndpoint {
      * @param subscriptionId 订阅标识符
      * @return 队列计划对象，包含队列名称和配置参数
      */
-    private QueuePlan resolveQueuePlan(RelaySession state, StompFrame frame, String subscriptionId) {
+    private QueuePlan resolveQueuePlan(RelaySession state, StompFrame frame,
+                                       String subscriptionId) {
         String providedQueue = resolveQueueNameFromHeaders(frame);
         boolean userProvided = providedQueue != null;
         String queueName = userProvided ? providedQueue : ephemeralQueueName(state.session, subscriptionId);
@@ -706,7 +669,7 @@ public class StompRelayEndpoint {
                 try {
                     subscription.consumer.cancel();
                     // 减少消费者计数
-                    queueMappingManager.decrementConsumer(subscription.destination.original);
+                    queueMappingManager.decrementConsumer(subscription.destination.original());
                 } catch (Exception ignored) {
                     // best effort
                 }
@@ -738,43 +701,5 @@ public class StompRelayEndpoint {
      */
     private record QueuePlan(String queueName, boolean declare, boolean durable, boolean exclusive, boolean autoDelete) {}
 
-    /**
-         * 目标地址类
-         * 表示 STOMP 消息的目标地址，可以是队列或交换机
-         */
-        private record Destination(StompRelayEndpoint.Destination.Type type, String original, String queue, String exchange,
-                                   String routingKey) {
-            enum Type {QUEUE, EXCHANGE}
 
-            private Destination(Type type, String original, String queue, String exchange, String routingKey) {
-                this.type = type;
-                this.original = original;
-                this.queue = queue;
-                this.exchange = exchange;
-                this.routingKey = Objects.requireNonNullElse(routingKey, "");
-            }
-
-            private static Destination forQueue(String original, String queue) {
-                return new Destination(Type.QUEUE, original, queue, null, "");
-            }
-
-            private static Destination forExchange(String original, String exchange, String routingKey) {
-                return new Destination(Type.EXCHANGE, original, null, exchange, routingKey);
-            }
-
-            private Destination withQueue(String queueName) {
-                if (type == Type.EXCHANGE) {
-                    return new Destination(Type.EXCHANGE, original, queueName, exchange, routingKey);
-                }
-                return this;
-            }
-
-            private boolean isQueue() {
-                return type == Type.QUEUE;
-            }
-
-            private boolean isExchange() {
-                return type == Type.EXCHANGE;
-            }
-        }
 }

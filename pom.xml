@@ -52,14 +52,6 @@
         </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>
-            <artifactId>quarkus-messaging-mqtt</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>io.quarkus</groupId>
-            <artifactId>quarkus-messaging-amqp</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>io.quarkus</groupId>
             <artifactId>quarkus-micrometer</artifactId>
         </dependency>
         <dependency>
@@ -79,8 +71,17 @@
             <artifactId>vertx-rabbitmq-client</artifactId>
         </dependency>
         <dependency>
+            <groupId>io.vertx</groupId>
+            <artifactId>vertx-proton</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-junit5</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-junit5-mockito</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -91,6 +92,12 @@
         <dependency>
             <groupId>org.mockito</groupId>
             <artifactId>mockito-core</artifactId>
+            <version>${org.mockito.mockito-core.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
             <version>${org.mockito.mockito-core.version}</version>
             <scope>test</scope>
         </dependency>

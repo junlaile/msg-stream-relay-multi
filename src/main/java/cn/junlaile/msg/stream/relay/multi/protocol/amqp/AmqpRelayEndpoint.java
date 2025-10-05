@@ -8,14 +8,9 @@ import cn.junlaile.msg.stream.relay.multi.rabbit.RabbitMQClientManager;
 import cn.junlaile.msg.stream.relay.multi.support.QueueMappingManager;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
+import io.vertx.proton.*;
 import io.vertx.rabbitmq.RabbitMQConsumer;
 import io.vertx.rabbitmq.RabbitMQMessage;
-import io.vertx.proton.ProtonConnection;
-import io.vertx.proton.ProtonDelivery;
-import io.vertx.proton.ProtonHelper;
-import io.vertx.proton.ProtonReceiver;
-import io.vertx.proton.ProtonSender;
-import io.vertx.proton.ProtonServer;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -110,7 +105,7 @@ public class AmqpRelayEndpoint {
         ConnectionContext context = new ConnectionContext();
         connections.put(connection, context);
 
-        connection.sessionOpenHandler(session -> session.open());
+        connection.sessionOpenHandler(ProtonSession::open);
         connection.receiverOpenHandler(receiver -> onReceiverOpen(connection, context, receiver));
         connection.senderOpenHandler(sender -> onSenderOpen(connection, context, sender));
         connection.closeHandler(closed -> {
@@ -360,39 +355,43 @@ public class AmqpRelayEndpoint {
     }
 
     private Buffer convertBody(Section section) {
-        if (section == null) {
-            return Buffer.buffer();
-        }
-        if (section instanceof Data data) {
-            Binary binary = data.getValue();
-            if (binary == null) {
+        switch (section) {
+            case null -> {
                 return Buffer.buffer();
             }
-            return Buffer.buffer().appendBytes(binary.getArray(), binary.getArrayOffset(), binary.getLength());
-        }
-        if (section instanceof AmqpValue value) {
-            Object payload = value.getValue();
-            if (payload instanceof Binary binary) {
+            case Data data -> {
+                Binary binary = data.getValue();
+                if (binary == null) {
+                    return Buffer.buffer();
+                }
                 return Buffer.buffer().appendBytes(binary.getArray(), binary.getArrayOffset(), binary.getLength());
             }
-            if (payload instanceof byte[] bytes) {
-                return Buffer.buffer().appendBytes(bytes);
+            case AmqpValue value -> {
+                Object payload = value.getValue();
+                if (payload instanceof Binary binary) {
+                    return Buffer.buffer().appendBytes(binary.getArray(), binary.getArrayOffset(), binary.getLength());
+                }
+                if (payload instanceof byte[] bytes) {
+                    return Buffer.buffer().appendBytes(bytes);
+                }
+                if (payload instanceof String text) {
+                    return Buffer.buffer(text, StandardCharsets.UTF_8.name());
+                }
+                if (payload instanceof Map<?, ?> map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> cast = (Map<String, Object>) map;
+                    return Buffer.buffer(new io.vertx.core.json.JsonObject(cast).encode());
+                }
+                if (payload instanceof List<?> list) {
+                    return Buffer.buffer(new io.vertx.core.json.JsonArray(list).encode());
+                }
+                return MessageConverter.toVertxBuffer(payload);
             }
-            if (payload instanceof String text) {
-                return Buffer.buffer(text, StandardCharsets.UTF_8.name());
+            case AmqpSequence sequence -> {
+                return Buffer.buffer(new io.vertx.core.json.JsonArray(sequence.getValue()).encode());
             }
-            if (payload instanceof Map<?, ?> map) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> cast = (Map<String, Object>) map;
-                return Buffer.buffer(new io.vertx.core.json.JsonObject(cast).encode());
+            default -> {
             }
-            if (payload instanceof List<?> list) {
-                return Buffer.buffer(new io.vertx.core.json.JsonArray(list).encode());
-            }
-            return MessageConverter.toVertxBuffer(payload);
-        }
-        if (section instanceof AmqpSequence sequence) {
-            return Buffer.buffer(new io.vertx.core.json.JsonArray(sequence.getValue()).encode());
         }
         return Buffer.buffer(section.toString());
     }
