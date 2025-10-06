@@ -2,6 +2,15 @@
 
 > 目的：将当前“create_sender = 订阅 / create_receiver = 发送”的临时倒置语义，逐步演进为符合 AMQP 1.0 规范（Receiver Link = 客户端接收；Sender Link = 客户端发送），并增强可靠性、可观测性和可扩展能力。
 
+当前进度概览：
+- [x] Phase 1：语义模式配置、日志标注、兼容层
+- [x] Phase 2：流控骨架、错误映射、队列策略（Receiver 订阅仍保留兼容提醒）
+- [x] Phase 3：共享订阅前缀与 TTL、即时清理调度
+- [x] Phase 4：基于 credit 的 RabbitMQ consumer 暂停/恢复、缓冲溢出策略
+- [x] Phase 5：Micrometer 指标（订阅总数、绑定数、下行/丢弃/背压计数）
+- [ ] Phase 6：更细粒度错误语义与恢复策略增强
+- [ ] Phase 7：选择器/插件化目标解析（规划中）
+
 ---
 ## 当前状态 (Baseline)
 - 服务端类：`AmqpRelayEndpoint`

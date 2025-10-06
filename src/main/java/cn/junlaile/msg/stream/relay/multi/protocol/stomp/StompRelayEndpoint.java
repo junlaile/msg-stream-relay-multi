@@ -5,6 +5,7 @@ import cn.junlaile.msg.stream.relay.multi.protocol.common.DestinationParser;
 import cn.junlaile.msg.stream.relay.multi.protocol.common.MessageConverter;
 import cn.junlaile.msg.stream.relay.multi.rabbit.RabbitMQClientManager;
 import cn.junlaile.msg.stream.relay.multi.support.QueueMappingManager;
+import cn.junlaile.msg.stream.relay.multi.support.QueueOptions;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.json.JsonObject;
 import io.vertx.rabbitmq.RabbitMQConsumer;
@@ -201,6 +202,8 @@ public class StompRelayEndpoint {
 
         final Destination initialDestination = destination;
         CompletionStage<RabbitMQConsumer> stage;
+        QueueMappingManager.QueueMapping mapping = null;
+
         if (initialDestination.isQueue()) {
             stage = clientManager.ensureConnected()
                     .thenCompose(ignored -> clientManager.createQueueConsumer(initialDestination.queue()));
@@ -212,29 +215,30 @@ public class StompRelayEndpoint {
             }
             boolean sharedQueue = "shared".equalsIgnoreCase(queueMode) || "load-balance".equalsIgnoreCase(queueMode);
 
-            QueueMappingManager.QueueMapping mapping;
+            QueueOptions options;
+            String cacheKey;
             if (sharedQueue) {
-                // 共享模式：多个客户端共享同一队列（负载均衡）
-                mapping = queueMappingManager.resolveQueue(
-                    initialDestination.original(),
-                    initialDestination.exchange(),
-                    initialDestination.routingKey()
-                );
+                options = queueMappingManager.defaultSharedQueueOptions();
+                cacheKey = initialDestination.original();
             } else {
-                // 广播模式（默认）：每个订阅独立队列（所有客户端都收到消息）
+                options = queueMappingManager.defaultDynamicQueueOptions();
                 String uniqueKey = state.session.getId() + ":" + subscriptionId;
-                mapping = queueMappingManager.resolveQueue(
-                    initialDestination.original() + ":" + uniqueKey,
-                    initialDestination.exchange(),
-                    initialDestination.routingKey()
-                );
+                cacheKey = initialDestination.original() + ":" + uniqueKey;
             }
+
+            mapping = queueMappingManager.resolveQueue(
+                cacheKey,
+                initialDestination.exchange(),
+                initialDestination.routingKey(),
+                options
+            );
 
             stage = createExchangeSubscription(state, frame, subscriptionId, initialDestination, mapping);
             destination = initialDestination.withQueue(mapping.queueName());
         }
 
         Destination finalDestination = destination;
+        final QueueMappingManager.QueueMapping finalMapping = mapping;
         stage.whenComplete((consumer, err) -> {
             if (err != null) {
                 LOG.errorf(err, "Failed to prepare subscription %s", finalDestination.original());
@@ -256,10 +260,12 @@ public class StompRelayEndpoint {
                     LOG.errorf(e, "Error forwarding message for subscription %s", subscriptionId);
                 }
             });
-            state.subscriptions.put(subscriptionId, new Subscription(consumer, finalDestination, finalDestination.queue()));
+            state.subscriptions.put(subscriptionId,
+                new Subscription(consumer, finalDestination, finalDestination.queue(), finalMapping));
 
-            // 增加消费者计数
-            queueMappingManager.incrementConsumer(finalDestination.original());
+            if (finalMapping != null) {
+                queueMappingManager.incrementConsumer(finalMapping.cacheKey());
+            }
 
             sendReceiptIfRequested(state, frame);
         });
@@ -284,7 +290,7 @@ public class StompRelayEndpoint {
         // 如果是新创建的队列，需要声明并绑定；否则直接创建消费者
         if (mapping.isNew()) {
             return clientManager.ensureConnected()
-                    .thenCompose(ignored -> declareQueueForMapping(mapping.queueName()))
+                    .thenCompose(ignored -> declareQueueForMapping(mapping))
                     .thenCompose(ignored -> bindQueueToExchange(mapping.queueName(), initialDestination))
                     .thenCompose(ignored -> createQueueConsumer(mapping.queueName()));
         } else {
@@ -300,8 +306,14 @@ public class StompRelayEndpoint {
      * @param queueName 队列名称
      * @return 异步操作结果，声明成功时完成
      */
-    private CompletionStage<Void> declareQueueForMapping(String queueName) {
-        return clientManager.declareQueue(queueName, false, false, true);
+    private CompletionStage<Void> declareQueueForMapping(QueueMappingManager.QueueMapping mapping) {
+        QueueOptions options = mapping.options();
+        return clientManager.declareQueue(
+            mapping.queueName(),
+            options.durable(),
+            options.exclusive(),
+            options.autoDelete()
+        );
     }
 
     /**
@@ -352,8 +364,9 @@ public class StompRelayEndpoint {
         }
         subscription.consumer.cancel();
 
-        // 减少消费者计数
-        queueMappingManager.decrementConsumer(subscription.destination.original());
+        if (subscription.mapping != null) {
+            queueMappingManager.decrementConsumer(subscription.mapping.cacheKey());
+        }
 
         sendReceiptIfRequested(state, frame);
     }
@@ -623,7 +636,7 @@ public class StompRelayEndpoint {
             }
 
             // 更新订阅记录
-            state.subscriptions.put(subscriptionId, new Subscription(consumer, destination, queueName));
+            state.subscriptions.put(subscriptionId, new Subscription(consumer, destination, queueName, oldSubscription.mapping));
             LOG.infof("Successfully recovered subscription %s", subscriptionId);
         });
     }
@@ -807,7 +820,9 @@ public class StompRelayEndpoint {
                 try {
                     subscription.consumer.cancel();
                     // 减少消费者计数
-                    queueMappingManager.decrementConsumer(subscription.destination.original());
+                    if (subscription.mapping != null) {
+                        queueMappingManager.decrementConsumer(subscription.mapping.cacheKey());
+                    }
                 } catch (Exception ignored) {
                     // best effort
                 }
@@ -825,7 +840,10 @@ public class StompRelayEndpoint {
      * @param destination 目标地址对象
      * @param queueName RabbitMQ 队列名称，用于连接断开后重新订阅
      */
-    private record Subscription(RabbitMQConsumer consumer, Destination destination, String queueName) {}
+    private record Subscription(RabbitMQConsumer consumer,
+                                 Destination destination,
+                                 String queueName,
+                                 QueueMappingManager.QueueMapping mapping) {}
 
     /**
      * 队列计划记录

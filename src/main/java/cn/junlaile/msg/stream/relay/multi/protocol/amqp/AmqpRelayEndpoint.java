@@ -1,12 +1,19 @@
 // AMQP 1.0 Relay Endpoint - 启用测试 v2
 package cn.junlaile.msg.stream.relay.multi.protocol.amqp;
 
+import cn.junlaile.msg.stream.relay.multi.config.AmqpRelayConfig;
 import cn.junlaile.msg.stream.relay.multi.config.AmqpRelayEndpointConfig;
 import cn.junlaile.msg.stream.relay.multi.protocol.common.Destination;
 import cn.junlaile.msg.stream.relay.multi.protocol.common.DestinationParser;
 import cn.junlaile.msg.stream.relay.multi.protocol.common.MessageConverter;
+import cn.junlaile.msg.stream.relay.multi.protocol.amqp.LinkRole;
+import cn.junlaile.msg.stream.relay.multi.protocol.amqp.SemanticMode;
 import cn.junlaile.msg.stream.relay.multi.rabbit.RabbitMQClientManager;
 import cn.junlaile.msg.stream.relay.multi.support.QueueMappingManager;
+import cn.junlaile.msg.stream.relay.multi.support.QueueOptions;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tags;
 import io.quarkus.runtime.Startup;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
@@ -24,20 +31,24 @@ import org.apache.qpid.proton.amqp.messaging.AmqpSequence;
 import org.apache.qpid.proton.amqp.messaging.AmqpValue;
 import org.apache.qpid.proton.amqp.messaging.Data;
 import org.apache.qpid.proton.amqp.messaging.Section;
-import org.apache.qpid.proton.amqp.transport.Source;
 import org.apache.qpid.proton.amqp.transport.ErrorCondition;
+import org.apache.qpid.proton.amqp.transport.Source;
 import org.apache.qpid.proton.amqp.messaging.Rejected;
 import org.apache.qpid.proton.message.Message;
 import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -51,12 +62,20 @@ public class AmqpRelayEndpoint {
     private static final Logger LOG = Logger.getLogger(AmqpRelayEndpoint.class);
     private static final Symbol ERROR_INVALID_DESTINATION = Symbol.getSymbol("amqp:invalid-field");
     private static final Symbol ERROR_INTERNAL = Symbol.getSymbol("amqp:internal-error");
+    private static final Symbol ERROR_NOT_FOUND = Symbol.getSymbol("amqp:not-found");
+    private static final Symbol ERROR_UNAUTHORIZED = Symbol.getSymbol("amqp:unauthorized-access");
+    private static final Symbol ERROR_QUEUE_BIND_FAILED = Symbol.getSymbol("relay:queue-bind-failed");
+    private static final Symbol ERROR_UNSUPPORTED_LINK_ROLE = Symbol.getSymbol("relay:unsupported-link-role");
     private static final String CONNECTION_CONTAINER = "amqp-relay";
 
     private final Vertx vertx;
     private final RabbitMQClientManager clientManager;
     private final QueueMappingManager queueMappingManager;
     private final AmqpRelayEndpointConfig config;
+    private final AmqpRelayConfig relayConfig;
+    private final FlowSettings flowSettings;
+    private final MeterRegistry meterRegistry;
+    private final ConcurrentMap<String, DestinationMetrics> destinationMetrics = new ConcurrentHashMap<>();
     private final ConcurrentMap<ProtonConnection, ConnectionContext> connections = new ConcurrentHashMap<>();
     private final AtomicLong outboundSequence = new AtomicLong();
 
@@ -66,14 +85,26 @@ public class AmqpRelayEndpoint {
     public AmqpRelayEndpoint(Vertx vertx,
                              RabbitMQClientManager clientManager,
                              QueueMappingManager queueMappingManager,
-                             AmqpRelayEndpointConfig config) {
+                             AmqpRelayEndpointConfig config,
+                             AmqpRelayConfig relayConfig,
+                             MeterRegistry meterRegistry) {
         LOG.info("🔧 AmqpRelayEndpoint constructor called - CDI injection working!");
         this.vertx = Objects.requireNonNull(vertx, "vertx");
         this.clientManager = Objects.requireNonNull(clientManager, "clientManager");
         this.queueMappingManager = Objects.requireNonNull(queueMappingManager, "queueMappingManager");
         this.config = Objects.requireNonNull(config, "config");
+        this.relayConfig = Objects.requireNonNull(relayConfig, "relayConfig");
+        this.flowSettings = FlowSettings.from(relayConfig);
+        this.meterRegistry = Objects.requireNonNull(meterRegistry, "meterRegistry");
+        registerGauges();
         LOG.infof("🔧 AmqpRelayEndpoint initialized with config: enabled=%s, host=%s, port=%d",
-                 config.enabled(), config.host(), config.port());
+                config.enabled(), config.host(), config.port());
+        LOG.infof("🔧 AMQP relay semantic-mode=%s, flow[min=%d,resume=%d,buffer=%d,overflow=%s]",
+                relayConfig.semanticMode(),
+                flowSettings.minCreditThreshold,
+                flowSettings.resumeCreditThreshold,
+                flowSettings.bufferSize,
+                flowSettings.overflowPolicy);
     }
 
     @PostConstruct
@@ -134,7 +165,9 @@ public class AmqpRelayEndpoint {
     private void onReceiverOpen(ProtonConnection connection,
                                 ConnectionContext context,
                                 ProtonReceiver receiver) {
-        // 回退为：Receiver link = 客户端发送（上行），仅用于接收客户端消息
+        SemanticMode semanticMode = relayConfig.semanticMode();
+        LinkRole role = LinkRole.INBOUND_PUBLISH;
+        // Receiver link = 客户端发送（上行），标准语义下仍用于上行 publish
         receiver.setAutoAccept(false);
         receiver.setTarget(receiver.getRemoteTarget());
         int credits = Math.max(1, config.initialCredits());
@@ -142,7 +175,10 @@ public class AmqpRelayEndpoint {
         receiver.flow(credits);
         receiver.open();
 
-        LOG.debugf("[AMQP] receiverOpen local=%s remoteTarget=%s", receiver.getName(),
+        LOG.debugf("[AMQP][mode=%s][role=%s] receiverOpen local=%s remoteTarget=%s",
+            semanticMode,
+            role,
+            receiver.getName(),
             receiver.getRemoteTarget() == null ? null : receiver.getRemoteTarget().getAddress());
 
         receiver.handler((delivery, message) -> handleInboundMessage(receiver, delivery, message));
@@ -171,7 +207,7 @@ public class AmqpRelayEndpoint {
         publishStage.whenComplete((ignored, err) -> {
             if (err != null) {
                 LOG.errorf(err, "Failed to publish AMQP message to %s", destination.original());
-                rejectDelivery(delivery, ERROR_INTERNAL, err.getMessage());
+                rejectDelivery(delivery, mapPublishError(err));
                 return;
             }
             delivery.disposition(Accepted.getInstance(), true);
@@ -184,8 +220,12 @@ public class AmqpRelayEndpoint {
                               ProtonSender sender) {
         Source remoteSource = sender.getRemoteSource();
         Destination destination = resolveSourceDestination(connection, remoteSource, sender);
-        LOG.debugf("[AMQP] senderOpen link=%s remoteSource=%s parsed=%s", sender.getName(),
-            remoteSource == null ? null : remoteSource.getAddress(), destination == null ? null : destination.original());
+        SemanticMode semanticMode = relayConfig.semanticMode();
+        LinkRole role = LinkRole.OUTBOUND_SUBSCRIBE;
+        LOG.debugf("[AMQP][mode=%s][role=%s] senderOpen link=%s remoteSource=%s parsed=%s", semanticMode,
+            role,
+            sender.getName(), remoteSource == null ? null : remoteSource.getAddress(),
+            destination == null ? null : destination.original());
         if (destination == null) {
             ErrorCondition condition = new ErrorCondition(ERROR_INVALID_DESTINATION, "Sender requires address");
             sender.setCondition(condition);
@@ -197,25 +237,34 @@ public class AmqpRelayEndpoint {
         prepareConsumer(destination, connection, sender).whenComplete((binding, err) -> {
             if (err != null) {
                 LOG.errorf(err, "Failed to create consumer for %s", destination.original());
-                ErrorCondition condition = new ErrorCondition(ERROR_INTERNAL, err.getMessage());
+                ErrorCondition condition = mapConsumerBindingError(err);
                 sender.setCondition(condition);
                 sender.open();
                 sender.close();
                 return;
             }
 
-            queueMappingManager.incrementConsumer(binding.destination().original());
-            context.addSender(sender, binding.destination(), binding.consumer());
+            if (binding.mapping() != null) {
+                queueMappingManager.incrementConsumer(binding.mapping().cacheKey());
+            }
+            FlowController flowController = new FlowController(sender, binding);
+            context.addSender(sender, new OutboundLink(binding, flowController));
 
             if (remoteSource != null) {
                 sender.setSource(remoteSource);
             }
+            sender.sendQueueDrainHandler(v -> flowController.onDrain());
+            flowController.onCredit(sender.getCredit());
             sender.open();
 
             sender.closeHandler(closed -> context.removeSender(sender, queueMappingManager));
             sender.detachHandler(detached -> context.removeSender(sender, queueMappingManager));
 
-            binding.consumer().handler(message -> forwardToSender(sender, binding.destination(), message));
+            binding.consumer().handler(message -> flowController.onBrokerMessage(message));
+            binding.consumer().exceptionHandler(t -> LOG.errorf(t,
+                "Rabbit consumer error for %s (queue=%s)",
+                binding.destination().original(),
+                binding.destination().queue()));
         });
     }
 
@@ -225,7 +274,7 @@ public class AmqpRelayEndpoint {
         if (destination.isQueue()) {
             return clientManager.ensureConnected()
                 .thenCompose(ignored -> clientManager.createQueueConsumer(destination.queue()))
-                .thenApply(consumer -> new ConsumerBinding(destination, consumer));
+                .thenApply(consumer -> new ConsumerBinding(destination, consumer, null));
         }
 
         String uniqueKey = connection.getRemoteContainer();
@@ -240,59 +289,61 @@ public class AmqpRelayEndpoint {
         Source remoteSource = sender.getRemoteSource();
         boolean sharedQueue = isShared(remoteSource);
 
-        QueueMappingManager.QueueMapping mapping;
-        if (sharedQueue) {
-            mapping = queueMappingManager.resolveQueue(destination.original(), destination.exchange(), destination.routingKey());
-        } else {
-            mapping = queueMappingManager.resolveQueue(destination.original() + ":" + uniqueKey,
-                destination.exchange(), destination.routingKey());
-        }
+        QueueOptions options = sharedQueue
+            ? queueMappingManager.defaultSharedQueueOptions()
+            : queueMappingManager.defaultDynamicQueueOptions();
+        String mappingKey = sharedQueue
+            ? destination.original()
+            : destination.original() + ":" + uniqueKey;
+
+        QueueMappingManager.QueueMapping mapping = queueMappingManager.resolveQueue(
+            mappingKey,
+            destination.exchange(),
+            destination.routingKey(),
+            options
+        );
 
         Destination finalDestination = destination.withQueue(mapping.queueName());
 
         CompletionStage<Void> readyStage;
         if (mapping.isNew()) {
+            QueueOptions queueOptions = mapping.options();
             readyStage = clientManager.ensureConnected()
-                .thenCompose(ignored -> clientManager.declareQueue(mapping.queueName(), false, false, true))
-                .thenCompose(ignored -> clientManager.bindQueue(mapping.queueName(), destination.exchange(), destination.routingKey()));
+                .thenCompose(ignored -> clientManager.declareQueue(
+                    mapping.queueName(),
+                    queueOptions.durable(),
+                    queueOptions.exclusive(),
+                    queueOptions.autoDelete()))
+                .thenCompose(ignored -> clientManager.bindQueue(
+                    mapping.queueName(),
+                    destination.exchange(),
+                    destination.routingKey()));
         } else {
             readyStage = clientManager.ensureConnected();
         }
 
         return readyStage.thenCompose(ignored -> clientManager.createQueueConsumer(mapping.queueName()))
-            .thenApply(consumer -> new ConsumerBinding(finalDestination, consumer));
+            .thenApply(consumer -> new ConsumerBinding(finalDestination, consumer, mapping));
     }
 
-    private boolean isShared(Source source) { // using transport.Source (limited info available)
-        return false; // capability detection not supported with transport.Source abstraction currently
-        /* if (source == null) {
+    private boolean isShared(Source source) {
+        if (source == null) {
             return false;
         }
-        if (source.getDistributionMode() != null) {
-            String mode = source.getDistributionMode().toString();
-            if ("move".equalsIgnoreCase(mode)) {
-                return true;
-            }
-        }
-        Symbol[] capabilities = source.getCapabilities();
-        if (capabilities != null) {
-            for (Symbol capability : capabilities) {
-                if (capability != null) {
-                    String value = capability.toString();
-                    if ("shared".equalsIgnoreCase(value) || "global".equalsIgnoreCase(value)) {
-                        return true;
-                    }
-                }
-            }
-        }
-        Map<Symbol, Object> properties = source.getProperties();
-        if (properties != null) {
-            Object shared = properties.get(Symbol.getSymbol("shared"));
-            if (shared instanceof Boolean bool && bool) {
-                return true;
-            }
-        }
-        return false; */
+
+        // In Proton-J 0.34.1, the transport.Source class doesn't have
+        // getDistributionMode(), getCapabilities(), and getProperties() methods.
+        // These methods were added in later versions.
+        //
+        // For now, we'll use a simplified implementation that can be enhanced
+        // later based on actual requirements and testing with AMQP 1.0 clients.
+
+        // TODO: Implement proper shared detection based on:
+        // 1. Upgrade to newer Proton-J version that supports these methods
+        // 2. Or use alternative approach like parsing link names or addresses
+        // 3. Or use Vert.x Proton's higher-level APIs if available
+
+        return false; // Default to non-shared for now
     }
 
     private Destination resolveDestination(ProtonReceiver receiver, Message message) {
@@ -359,10 +410,7 @@ public class AmqpRelayEndpoint {
         return DestinationParser.parse(dynamicAddress);
     }
 
-    private void forwardToSender(ProtonSender sender, Destination destination, RabbitMQMessage message) {
-        if (!sender.isOpen()) {
-            return;
-        }
+    private Message buildOutboundMessage(Destination destination, RabbitMQMessage message) {
         Message amqp = Message.Factory.create();
         amqp.setMessageId("relay-" + outboundSequence.incrementAndGet());
         amqp.setAddress(destination.original());
@@ -371,8 +419,14 @@ public class AmqpRelayEndpoint {
         if (message.properties() != null && message.properties().getContentType() != null) {
             amqp.setContentType(message.properties().getContentType());
         }
+        return amqp;
+    }
 
-        sender.send(amqp);
+    private void forwardToSender(ProtonSender sender, Destination destination, RabbitMQMessage message) {
+        if (!sender.isOpen()) {
+            return;
+        }
+        sender.send(buildOutboundMessage(destination, message));
     }
 
     private Buffer convertBody(Section section) {
@@ -424,6 +478,64 @@ public class AmqpRelayEndpoint {
         delivery.disposition(rejected, true);
     }
 
+    private void rejectDelivery(ProtonDelivery delivery, ErrorCondition condition) {
+        if (condition == null) {
+            condition = new ErrorCondition(ERROR_INTERNAL, null);
+        }
+        rejectDelivery(delivery, condition.getCondition(), condition.getDescription());
+    }
+
+    private ErrorCondition mapConsumerBindingError(Throwable err) {
+        Symbol symbol = resolveErrorSymbol(err, ERROR_QUEUE_BIND_FAILED);
+        return new ErrorCondition(symbol, safeErrorDescription(err));
+    }
+
+    private ErrorCondition mapPublishError(Throwable err) {
+        Symbol symbol = resolveErrorSymbol(err, ERROR_INTERNAL);
+        return new ErrorCondition(symbol, safeErrorDescription(err));
+    }
+
+    private Symbol resolveErrorSymbol(Throwable err, Symbol defaultSymbol) {
+        if (err == null) {
+            return defaultSymbol;
+        }
+        Throwable root = rootCause(err);
+        String message = root.getMessage();
+        if (message != null) {
+            String normalized = message.toLowerCase(Locale.ROOT);
+            if (normalized.contains("not found")
+                || normalized.contains("no queue")
+                || normalized.contains("no exchange")
+                || normalized.contains("404")) {
+                return ERROR_NOT_FOUND;
+            }
+            if (normalized.contains("access refused")
+                || normalized.contains("access-refused")
+                || normalized.contains("unauthorized")
+                || normalized.contains("permission")) {
+                return ERROR_UNAUTHORIZED;
+            }
+            if (normalized.contains("bind") && normalized.contains("fail")) {
+                return ERROR_QUEUE_BIND_FAILED;
+            }
+        }
+        return defaultSymbol;
+    }
+
+    private String safeErrorDescription(Throwable err) {
+        Throwable root = rootCause(err);
+        String message = root.getMessage();
+        return message == null ? root.getClass().getSimpleName() : message;
+    }
+
+    private Throwable rootCause(Throwable err) {
+        Throwable current = err;
+        while (current.getCause() != null && current.getCause() != current) {
+            current = current.getCause();
+        }
+        return current;
+    }
+
     private String buildExchangeAddress(String exchange, String routingKey) {
         if (exchange == null || exchange.isBlank()) {
             return null;
@@ -454,31 +566,341 @@ public class AmqpRelayEndpoint {
         }
     }
 
-    private record ConsumerBinding(Destination destination, RabbitMQConsumer consumer) {
+    private void registerGauges() {
+        meterRegistry.gauge("amqp_relay_active_subscriptions", this, endpoint -> endpoint.computeActiveSubscriptions());
+        meterRegistry.gauge("amqp_relay_rabbitmq_bindings", queueMappingManager,
+            manager -> {
+                QueueMappingManager.CacheStats stats = manager.getStats();
+                return (double) stats.totalQueues();
+            });
+    }
+
+    private double computeActiveSubscriptions() {
+        return connections.values().stream()
+            .mapToInt(ConnectionContext::subscriptionCount)
+            .sum();
+    }
+
+    private DestinationMetrics resolveMetrics(Destination destination) {
+        String key = metricKey(destination);
+        return destinationMetrics.computeIfAbsent(key, k -> createMetrics(destination));
+    }
+
+    private DestinationMetrics createMetrics(Destination destination) {
+        Tags tags = metricTagsFor(destination);
+        Counter outbound = meterRegistry.counter("amqp_relay_outbound_messages_total", tags);
+        Counter dropped = meterRegistry.counter("amqp_relay_dropped_messages_total", tags);
+        Counter backpressure = meterRegistry.counter("amqp_relay_backpressure_events_total", tags);
+        return new DestinationMetrics(outbound, dropped, backpressure);
+    }
+
+    private Tags metricTagsFor(Destination destination) {
+        String mode = relayConfig.semanticMode().name().toLowerCase(Locale.ROOT);
+        if (destination.isQueue()) {
+            return Tags.of(
+                "mode", mode,
+                "type", "queue",
+                "queue", safeTagValue(destination.queue()),
+                "exchange", "",
+                "routingKey", ""
+            );
+        }
+        return Tags.of(
+            "mode", mode,
+            "type", "exchange",
+            "queue", "",
+            "exchange", safeTagValue(destination.exchange()),
+            "routingKey", safeTagValue(destination.routingKey())
+        );
+    }
+
+    private String metricKey(Destination destination) {
+        if (destination.isQueue()) {
+            return "queue:" + safeTagValue(destination.queue());
+        }
+        return "exchange:" + safeTagValue(destination.exchange()) + ':' + safeTagValue(destination.routingKey());
+    }
+
+    private String safeTagValue(String value) {
+        return value == null ? "" : value;
+    }
+
+    private record ConsumerBinding(Destination destination,
+                                   RabbitMQConsumer consumer,
+                                   QueueMappingManager.QueueMapping mapping) {
+    }
+
+    private static final class OutboundLink {
+        private final ConsumerBinding binding;
+        private final FlowController flowController;
+
+        OutboundLink(ConsumerBinding binding, FlowController flowController) {
+            this.binding = binding;
+            this.flowController = flowController;
+        }
+
+        void close(QueueMappingManager queueMappingManager) {
+            flowController.close();
+            try {
+                binding.consumer().cancel();
+            } catch (Exception e) {
+                LOG.warnf(e, "Failed to cancel consumer for %s", binding.destination().original());
+            }
+            if (binding.mapping() != null) {
+                queueMappingManager.decrementConsumer(binding.mapping().cacheKey());
+            }
+        }
     }
 
     private static final class ConnectionContext {
-        private final ConcurrentMap<ProtonSender, ConsumerBinding> outboundLinks = new ConcurrentHashMap<>();
+        private final ConcurrentMap<ProtonSender, OutboundLink> outboundLinks = new ConcurrentHashMap<>();
 
-        void addSender(ProtonSender sender, Destination destination, RabbitMQConsumer consumer) {
-            outboundLinks.put(sender, new ConsumerBinding(destination, consumer));
+        void addSender(ProtonSender sender, OutboundLink outboundLink) {
+            outboundLinks.put(sender, outboundLink);
         }
 
         void removeSender(ProtonSender sender, QueueMappingManager queueMappingManager) {
-            ConsumerBinding binding = outboundLinks.remove(sender);
-            if (binding != null) {
-                try {
-                    binding.consumer().cancel();
-                } catch (Exception e) {
-                    LOG.warnf(e, "Failed to cancel consumer for %s", binding.destination().original());
-                }
-                queueMappingManager.decrementConsumer(binding.destination().original());
+            OutboundLink link = outboundLinks.remove(sender);
+            if (link != null) {
+                link.close(queueMappingManager);
             }
         }
 
         void close(QueueMappingManager queueMappingManager) {
             outboundLinks.keySet().forEach(sender -> removeSender(sender, queueMappingManager));
             outboundLinks.clear();
+        }
+
+        int subscriptionCount() {
+            return outboundLinks.size();
+        }
+    }
+
+    private enum BufferOverflowPolicy {
+        DROP_OLDEST,
+        DROP_NEW,
+        BLOCK;
+
+        static BufferOverflowPolicy from(String value) {
+            if (value == null) {
+                return DROP_OLDEST;
+            }
+            String normalized = value.trim().toLowerCase(Locale.ROOT);
+            return switch (normalized) {
+                case "drop-new" -> DROP_NEW;
+                case "block" -> BLOCK;
+                default -> DROP_OLDEST;
+            };
+        }
+    }
+
+    private static final class FlowSettings {
+        final int minCreditThreshold;
+        final int resumeCreditThreshold;
+        final int bufferSize;
+        final BufferOverflowPolicy overflowPolicy;
+
+        private FlowSettings(int minCreditThreshold,
+                             int resumeCreditThreshold,
+                             int bufferSize,
+                             BufferOverflowPolicy overflowPolicy) {
+            this.minCreditThreshold = minCreditThreshold;
+            this.resumeCreditThreshold = resumeCreditThreshold;
+            this.bufferSize = bufferSize;
+            this.overflowPolicy = overflowPolicy;
+        }
+
+        static FlowSettings from(AmqpRelayConfig config) {
+            int min = Math.max(0, config.flowMinCreditThreshold());
+            int resume = Math.max(min + 1, config.flowResumeCreditThreshold());
+            int buffer = Math.max(1, config.flowBufferSize());
+            BufferOverflowPolicy policy = BufferOverflowPolicy.from(config.flowBufferOverflowPolicy());
+            return new FlowSettings(min, resume, buffer, policy);
+        }
+    }
+
+    private static final class DestinationMetrics {
+        final Counter outbound;
+        final Counter dropped;
+        final Counter backpressure;
+
+        DestinationMetrics(Counter outbound, Counter dropped, Counter backpressure) {
+            this.outbound = outbound;
+            this.dropped = dropped;
+            this.backpressure = backpressure;
+        }
+    }
+
+    private final class FlowController {
+        private final ProtonSender sender;
+        private final ConsumerBinding binding;
+        private final RabbitMQConsumer consumer;
+        private final Destination destination;
+        private final QueueMappingManager.QueueMapping mapping;
+        private final DestinationMetrics metrics;
+        private final Deque<RabbitMQMessage> buffer = new ArrayDeque<>();
+        private final AtomicBoolean consumerPaused = new AtomicBoolean(false);
+        private final AtomicBoolean closed = new AtomicBoolean(false);
+
+        private long droppedMessages;
+        private long deliveredMessages;
+        private long backpressureEvents;
+
+        FlowController(ProtonSender sender, ConsumerBinding binding) {
+            this.sender = sender;
+            this.binding = binding;
+            this.consumer = binding.consumer();
+            this.destination = binding.destination();
+            this.mapping = binding.mapping();
+            this.metrics = resolveMetrics(this.destination);
+        }
+
+        void onBrokerMessage(RabbitMQMessage message) {
+            if (closed.get()) {
+                return;
+            }
+
+            boolean added = false;
+            RabbitMQMessage dropped = null;
+            synchronized (buffer) {
+                if (buffer.size() >= flowSettings.bufferSize) {
+                    dropped = handleOverflow(message);
+                    added = flowSettings.overflowPolicy == BufferOverflowPolicy.DROP_OLDEST;
+                } else {
+                    buffer.addLast(message);
+                    added = true;
+                }
+            }
+
+            if (dropped != null) {
+                LOG.warnf("Dropping message for %s due to buffer overflow (policy=%s, size=%d)",
+                        destination.original(), flowSettings.overflowPolicy, flowSettings.bufferSize);
+                droppedMessages++;
+                metrics.dropped.increment();
+            }
+
+            if (added) {
+                flush();
+            } else {
+                adjustConsumerState();
+            }
+        }
+
+        void onCredit(int credit) {
+            if (closed.get()) {
+                return;
+            }
+            flush();
+        }
+
+        void onDrain() {
+            if (closed.get()) {
+                return;
+            }
+            flush();
+        }
+
+        private RabbitMQMessage handleOverflow(RabbitMQMessage incoming) {
+            return switch (flowSettings.overflowPolicy) {
+                case DROP_OLDEST -> {
+                    RabbitMQMessage removed = buffer.pollFirst();
+                    buffer.addLast(incoming);
+                    yield removed;
+                }
+                case DROP_NEW -> incoming;
+                case BLOCK -> {
+                    pauseConsumer("buffer overflow");
+                    yield incoming;
+                }
+            };
+        }
+
+        private void flush() {
+            if (closed.get()) {
+                return;
+            }
+
+            synchronized (buffer) {
+                while (!buffer.isEmpty() && sender.isOpen() && !sender.sendQueueFull() && sender.getCredit() > 0) {
+                    RabbitMQMessage next = buffer.pollFirst();
+                    try {
+                        sender.send(buildOutboundMessage(destination, next));
+                        deliveredMessages++;
+                        metrics.outbound.increment();
+                    } catch (Exception e) {
+                        LOG.errorf(e, "Failed to forward message for %s", destination.original());
+                        buffer.addFirst(next);
+                        break;
+                    }
+                }
+            }
+
+            adjustConsumerState();
+        }
+
+        private void adjustConsumerState() {
+            if (closed.get()) {
+                return;
+            }
+            int credit = sender.getCredit();
+            boolean queueFull = sender.sendQueueFull();
+            if (!consumerPaused.get() && (credit <= flowSettings.minCreditThreshold || queueFull)) {
+                pauseConsumer(String.format("credit=%d,queueFull=%s", credit, queueFull));
+            } else if (consumerPaused.get()
+                    && credit >= flowSettings.resumeCreditThreshold
+                    && !queueFull
+                    && buffer.isEmpty()) {
+                resumeConsumer(String.format("credit=%d", credit));
+            }
+        }
+
+        void close() {
+            if (closed.compareAndSet(false, true)) {
+                synchronized (buffer) {
+                    buffer.clear();
+                }
+                resumeConsumer("close");
+            }
+        }
+
+        private void pauseConsumer(String reason) {
+            if (consumerPaused.compareAndSet(false, true)) {
+                try {
+                    consumer.pause();
+                } catch (Exception e) {
+                    LOG.warnf(e, "Failed to pause RabbitMQ consumer for %s", destination.original());
+                }
+                backpressureEvents++;
+                metrics.backpressure.increment();
+                LOG.debugf("Paused RabbitMQ consumer for %s (%s)", destination.original(), reason);
+            }
+        }
+
+        private void resumeConsumer(String reason) {
+            if (consumerPaused.compareAndSet(true, false)) {
+                try {
+                    consumer.resume();
+                } catch (Exception e) {
+                    LOG.warnf(e, "Failed to resume RabbitMQ consumer for %s", destination.original());
+                }
+                LOG.debugf("Resumed RabbitMQ consumer for %s (%s)", destination.original(), reason);
+            }
+        }
+
+        long droppedMessages() {
+            return droppedMessages;
+        }
+
+        long deliveredMessages() {
+            return deliveredMessages;
+        }
+
+        long backpressureEvents() {
+            return backpressureEvents;
+        }
+
+        QueueMappingManager.QueueMapping mapping() {
+            return mapping;
         }
     }
 }

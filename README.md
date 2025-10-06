@@ -78,9 +78,11 @@
 支持 STOMP over WebSocket 客户端（如 JavaScript SockJS + STOMP.js）和 AMQP 1.0 客户端（如 Qpid Proton / Qpid JMS）。客户端可进行消息订阅和发送，支持动态队列创建和绑定。
 
 ⚠️ AMQP 1.0 当前语义说明：
-- create_sender → 订阅（服务端在 senderOpen 创建 RabbitMQ consumer 并推送）
-- create_receiver → 向 RabbitMQ 发送（服务端转发到队列/交换机）
-- 后续版本将对齐为标准语义（create_receiver = 订阅）。
+- 默认 `relay.amqp.semantic-mode=legacy`：`create_sender` → 订阅（服务端在 `senderOpen` 创建 RabbitMQ consumer 并推送），`create_receiver` → 向 RabbitMQ 发送。
+- 设置 `relay.amqp.semantic-mode=standard` 时，对外暴露标准语义；`create_receiver` 为订阅路径，`create_sender` 执行发送。当前实现仍保留向后兼容日志，并在不支持的场景返回语义提示。
+- 新增队列策略配置（动态队列、共享队列前缀、TTL、持久化开关），详见 `application.properties`。
+- 引入链路流控：根据 link credit 自动暂停/恢复 RabbitMQ consumer，支持缓冲区策略 `drop-oldest|drop-new|block`。
+- Micrometer 指标输出：`amqp_relay_active_subscriptions`、`amqp_relay_rabbitmq_bindings`、`amqp_relay_outbound_messages_total`、`amqp_relay_dropped_messages_total`、`amqp_relay_backpressure_events_total`，可用于观察订阅、丢弃、背压事件。
 
 地址格式示例：
 - 交换机：`/exchange/amq.topic/topic.test`
