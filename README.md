@@ -71,11 +71,20 @@
 ### AMQP 1.0 端点
 | 端点 | 协议 | 端口 | 说明 |
 |------|------|------|------|
-| AMQP 1.0 | AMQP 1.0 | 5673 | 原生 AMQP 1.0 协议支持 |
+| AMQP 1.0 | AMQP 1.0 | 5673 | 原生 AMQP 1.0 协议支持（当前订阅需使用 sender link，见下文说明）
 
 ## 客户端连接
 
-支持 STOMP over WebSocket 客户端（如 JavaScript SockJS + STOMP.js）和 AMQP 1.0 客户端（如 Qpid JMS）连接。客户端可进行消息订阅和发送，支持动态队列创建和绑定。
+支持 STOMP over WebSocket 客户端（如 JavaScript SockJS + STOMP.js）和 AMQP 1.0 客户端（如 Qpid Proton / Qpid JMS）。客户端可进行消息订阅和发送，支持动态队列创建和绑定。
+
+⚠️ AMQP 1.0 当前语义说明：
+- create_sender → 订阅（服务端在 senderOpen 创建 RabbitMQ consumer 并推送）
+- create_receiver → 向 RabbitMQ 发送（服务端转发到队列/交换机）
+- 后续版本将对齐为标准语义（create_receiver = 订阅）。
+
+地址格式示例：
+- 交换机：`/exchange/amq.topic/topic.test`
+- 队列：`/queue/my.queue`
 
 ## 开发指南
 

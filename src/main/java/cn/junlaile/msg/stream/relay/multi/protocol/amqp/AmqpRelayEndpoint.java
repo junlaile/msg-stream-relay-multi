@@ -1,3 +1,4 @@
+// AMQP 1.0 Relay Endpoint - 启用测试 v2
 package cn.junlaile.msg.stream.relay.multi.protocol.amqp;
 
 import cn.junlaile.msg.stream.relay.multi.config.AmqpRelayEndpointConfig;
@@ -6,6 +7,7 @@ import cn.junlaile.msg.stream.relay.multi.protocol.common.DestinationParser;
 import cn.junlaile.msg.stream.relay.multi.protocol.common.MessageConverter;
 import cn.junlaile.msg.stream.relay.multi.rabbit.RabbitMQClientManager;
 import cn.junlaile.msg.stream.relay.multi.support.QueueMappingManager;
+import io.quarkus.runtime.Startup;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.proton.*;
@@ -42,6 +44,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * AMQP 1.0 端点，直接接收 AMQP 客户端消息并转发到 RabbitMQ，
  * 同时支持将 RabbitMQ 队列数据推送回 AMQP 客户端。
  */
+@Startup
 @ApplicationScoped
 public class AmqpRelayEndpoint {
 
@@ -64,28 +67,40 @@ public class AmqpRelayEndpoint {
                              RabbitMQClientManager clientManager,
                              QueueMappingManager queueMappingManager,
                              AmqpRelayEndpointConfig config) {
+        LOG.info("🔧 AmqpRelayEndpoint constructor called - CDI injection working!");
         this.vertx = Objects.requireNonNull(vertx, "vertx");
         this.clientManager = Objects.requireNonNull(clientManager, "clientManager");
         this.queueMappingManager = Objects.requireNonNull(queueMappingManager, "queueMappingManager");
         this.config = Objects.requireNonNull(config, "config");
+        LOG.infof("🔧 AmqpRelayEndpoint initialized with config: enabled=%s, host=%s, port=%d",
+                 config.enabled(), config.host(), config.port());
     }
 
     @PostConstruct
     void start() {
+        LOG.infof("🚀 AmqpRelayEndpoint starting... enabled: %s, host: %s, port: %d",
+                 config.enabled(), config.host(), config.port());
+
         if (!config.enabled()) {
-            LOG.info("AMQP relay endpoint disabled via configuration");
+            LOG.info("❌ AMQP relay endpoint disabled via configuration");
             return;
         }
-        ProtonServer created = ProtonServer.create(vertx);
-        created.connectHandler(this::handleConnection);
-        created.listen(config.port(), config.host(), result -> {
-            if (result.succeeded()) {
-                LOG.infof("AMQP relay listening on %s:%d", config.host(), config.port());
-            } else {
-                LOG.error("Failed to start AMQP relay endpoint", result.cause());
-            }
-        });
-        server = created;
+
+        try {
+            ProtonServer created = ProtonServer.create(vertx);
+            created.connectHandler(this::handleConnection);
+            created.listen(config.port(), config.host(), result -> {
+                if (result.succeeded()) {
+                    LOG.infof("✅ AmqpRelayEndpoint listening on %s:%d", config.host(), config.port());
+                } else {
+                    LOG.error("❌ Failed to start AmqpRelayEndpoint", result.cause());
+                }
+            });
+            server = created;
+            LOG.info("📝 AmqpRelayEndpoint server created successfully");
+        } catch (Exception e) {
+            LOG.error("❌ Exception starting AmqpRelayEndpoint", e);
+        }
     }
 
     @PreDestroy
@@ -119,12 +134,16 @@ public class AmqpRelayEndpoint {
     private void onReceiverOpen(ProtonConnection connection,
                                 ConnectionContext context,
                                 ProtonReceiver receiver) {
+        // 回退为：Receiver link = 客户端发送（上行），仅用于接收客户端消息
         receiver.setAutoAccept(false);
         receiver.setTarget(receiver.getRemoteTarget());
         int credits = Math.max(1, config.initialCredits());
         receiver.setPrefetch(credits);
         receiver.flow(credits);
         receiver.open();
+
+        LOG.debugf("[AMQP] receiverOpen local=%s remoteTarget=%s", receiver.getName(),
+            receiver.getRemoteTarget() == null ? null : receiver.getRemoteTarget().getAddress());
 
         receiver.handler((delivery, message) -> handleInboundMessage(receiver, delivery, message));
         receiver.closeHandler(closed -> LOG.debugf("Receiver link closed: %s", receiver.getName()));
@@ -165,6 +184,8 @@ public class AmqpRelayEndpoint {
                               ProtonSender sender) {
         Source remoteSource = sender.getRemoteSource();
         Destination destination = resolveSourceDestination(connection, remoteSource, sender);
+        LOG.debugf("[AMQP] senderOpen link=%s remoteSource=%s parsed=%s", sender.getName(),
+            remoteSource == null ? null : remoteSource.getAddress(), destination == null ? null : destination.original());
         if (destination == null) {
             ErrorCondition condition = new ErrorCondition(ERROR_INVALID_DESTINATION, "Sender requires address");
             sender.setCondition(condition);

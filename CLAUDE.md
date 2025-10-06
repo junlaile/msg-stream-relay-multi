@@ -24,15 +24,23 @@ mvn clean test
 mvn clean package
 mvn clean package -DskipTests
 
-# Service endpoints (when running)
+# Run specific test classes
+mvn test -Dtest=AmqpRelayEndpointTest
+mvn test -Dtest=CustomHeadersTest
+
+# Debug mode (opens port 5005)
+mvn quarkus:dev -Ddebug=5005
+
+# Development UI and monitoring
+curl http://localhost:15674/q/dev-ui
+curl http://localhost:15674/q/dev
+
+# Service health checks (when running)
 curl http://localhost:15674/api/health
 curl http://localhost:15674/api/queue-mapping/stats
 
-# Debug mode
-mvn quarkus:dev -Ddebug=5005
-
-# Development UI
-curl http://localhost:15674/q/dev-ui
+# Test coverage
+mvn clean verify jacoco:report
 ```
 
 **Service URLs:**
@@ -55,7 +63,7 @@ curl http://localhost:15674/q/dev-ui
 
 **Key Classes:**
 1. **StompRelayEndpoint** (`/ws`) - Main WebSocket endpoint handling STOMP protocol
-2. **AmqpRelayEndpoint** - AMQP 1.0 protocol endpoint
+2. **AmqpRelayEndpoint** - AMQP 1.0 endpoint (marked `@Startup`) that exposes the relay server
 3. **RabbitMQClientManager** - RabbitMQ connection lifecycle management
 4. **QueueMappingManager** - Three-tier queue mapping cache system
 5. **HealthCheckResource** - REST health check endpoints
@@ -97,8 +105,8 @@ All configuration properties support environment variable override with the patt
 
 - Tests mirror production package structure in `src/test/java/`
 - Use `@QuarkusTest` for integration tests
-- Focus on core components: `QueueMappingManager`, `StompRelayEndpoint`, health endpoints
-- Current test coverage: One integration test for AMQP endpoint
+- Current test coverage: AMQP endpoint integration tests and STOMP custom headers tests
+- Key test classes: `AmqpRelayEndpointTest`, `CustomHeadersTest`
 - Test utilities available in `cn.junlaile.msg.stream.relay.multi.support`
 
 **Testing Commands:**
@@ -106,12 +114,47 @@ All configuration properties support environment variable override with the patt
 # Run all tests
 mvn clean test
 
-# Run specific test class
+# Run specific test classes
 mvn test -Dtest=AmqpRelayEndpointTest
+mvn test -Dtest=CustomHeadersTest
 
 # Run with coverage
 mvn clean verify jacoco:report
 ```
+
+## Testing with Python Scripts
+
+The project includes Python test scripts for AMQP protocol testing:
+
+**Quick Service Check:**
+```bash
+python3 simple_check.py  # Basic health check
+python3 check_service.py # Detailed service status
+```
+
+**Direct RabbitMQ Testing (AMQP 0.9.1):**
+```bash
+# Install pika dependency
+pip3 install pika
+
+# Send messages
+python3 amqp_producer_simple.py 5  # Send 5 messages
+
+# Receive messages
+python3 amqp_consumer_simple.py
+```
+
+**AMQP 1.0 Relay Testing:**
+```bash
+# Install proton dependency
+pip3 install python-qpid-proton
+
+# Test through AMQP 1.0 relay endpoint
+python3 amqp_topic_producer.py 5   # Send via relay
+python3 amqp_simple_consumer.py    # Receive via relay
+```
+
+*See `AMQP_TEST_GUIDE.md` for complete testing procedures and troubleshooting.*
 
 ## Code Style Guidelines
 
@@ -139,10 +182,11 @@ mvn clean verify jacoco:report
 4. **AMQP 1.0 Issues**: Verify `AmqpRelayEndpoint` configuration
 
 **Debug Tools:**
-- Use `curl http://localhost:15674/q/dev` for development info
+- Use `curl http://localhost:15674/q/dev` or `curl http://localhost:15674/q/dev-ui` for development info
 - Check logs for `QueueMappingManager` cache statistics
 - Monitor WebSocket connections through browser dev tools
 - Use RabbitMQ Management UI for queue inspection
+- Run Python test scripts: `python3 simple_check.py` for quick health validation
 
 ## Git Conventions
 
