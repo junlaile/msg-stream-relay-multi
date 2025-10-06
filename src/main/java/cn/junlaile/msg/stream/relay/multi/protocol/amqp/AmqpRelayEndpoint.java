@@ -8,6 +8,7 @@ import cn.junlaile.msg.stream.relay.multi.protocol.common.DestinationParser;
 import cn.junlaile.msg.stream.relay.multi.protocol.common.MessageConverter;
 import cn.junlaile.msg.stream.relay.multi.protocol.amqp.LinkRole;
 import cn.junlaile.msg.stream.relay.multi.protocol.amqp.SemanticMode;
+import cn.junlaile.msg.stream.relay.multi.rabbit.QueueAttributes;
 import cn.junlaile.msg.stream.relay.multi.rabbit.RabbitMQClientManager;
 import cn.junlaile.msg.stream.relay.multi.support.QueueMappingManager;
 import cn.junlaile.msg.stream.relay.multi.support.QueueOptions;
@@ -32,11 +33,13 @@ import org.apache.qpid.proton.amqp.messaging.AmqpValue;
 import org.apache.qpid.proton.amqp.messaging.Data;
 import org.apache.qpid.proton.amqp.messaging.Section;
 import org.apache.qpid.proton.amqp.transport.ErrorCondition;
-import org.apache.qpid.proton.amqp.transport.Source;
+import org.apache.qpid.proton.amqp.messaging.Source;
 import org.apache.qpid.proton.amqp.messaging.Rejected;
 import org.apache.qpid.proton.message.Message;
 import org.jboss.logging.Logger;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -44,12 +47,17 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 /**
  * AMQP 1.0 端点，直接接收 AMQP 客户端消息并转发到 RabbitMQ，
@@ -218,7 +226,7 @@ public class AmqpRelayEndpoint {
     private void onSenderOpen(ProtonConnection connection,
                               ConnectionContext context,
                               ProtonSender sender) {
-        Source remoteSource = sender.getRemoteSource();
+        Source remoteSource = (Source) sender.getRemoteSource();
         Destination destination = resolveSourceDestination(connection, remoteSource, sender);
         SemanticMode semanticMode = relayConfig.semanticMode();
         LinkRole role = LinkRole.OUTBOUND_SUBSCRIBE;
@@ -234,7 +242,7 @@ public class AmqpRelayEndpoint {
             return;
         }
 
-        prepareConsumer(destination, connection, sender).whenComplete((binding, err) -> {
+        prepareConsumer(destination, connection, sender, remoteSource).whenComplete((binding, err) -> {
             if (err != null) {
                 LOG.errorf(err, "Failed to create consumer for %s", destination.original());
                 ErrorCondition condition = mapConsumerBindingError(err);
@@ -270,8 +278,13 @@ public class AmqpRelayEndpoint {
 
     private CompletionStage<ConsumerBinding> prepareConsumer(Destination destination,
                                                              ProtonConnection connection,
-                                                             ProtonSender sender) {
+                                                             ProtonSender sender,
+                                                             Source remoteSource) {
         if (destination.isQueue()) {
+            PersistentQueueDecision decision = evaluatePersistentQueue(remoteSource, destination);
+            if (decision.enabled()) {
+                return preparePersistentQueueConsumer(destination, decision);
+            }
             return clientManager.ensureConnected()
                 .thenCompose(ignored -> clientManager.createQueueConsumer(destination.queue()))
                 .thenApply(consumer -> new ConsumerBinding(destination, consumer, null));
@@ -286,7 +299,6 @@ public class AmqpRelayEndpoint {
         }
         uniqueKey = uniqueKey + ":" + sender.getName();
 
-        Source remoteSource = sender.getRemoteSource();
         boolean sharedQueue = isShared(remoteSource);
 
         QueueOptions options = sharedQueue
@@ -326,24 +338,257 @@ public class AmqpRelayEndpoint {
             .thenApply(consumer -> new ConsumerBinding(finalDestination, consumer, mapping));
     }
 
+    private PersistentQueueDecision evaluatePersistentQueue(Source remoteSource, Destination destination) {
+        if (!destination.isQueue()) {
+            return PersistentQueueDecision.disabled();
+        }
+
+        AmqpRelayConfig.PersistentQueueConfig persistentConfig = relayConfig.persistent();
+        if (persistentConfig == null || !persistentConfig.enabled()) {
+            return PersistentQueueDecision.disabled();
+        }
+
+        String queueName = destination.queue();
+        if (queueName == null || queueName.isBlank()) {
+            return PersistentQueueDecision.disabled();
+        }
+
+        if (!PersistentQueueSupport.matchesPersistentPattern(queueName, persistentConfig.namePatterns())) {
+            return PersistentQueueDecision.disabled();
+        }
+
+        QueueAttributes attributes = PersistentQueueSupport.extractQueueAttributes(remoteSource);
+        if (LOG.isDebugEnabled()) {
+            LOG.debugf("Persistent queue request detected: queue=%s, attributes=%s", queueName, attributes);
+        }
+        return new PersistentQueueDecision(true, attributes, persistentConfig);
+    }
+
+    private CompletionStage<ConsumerBinding> preparePersistentQueueConsumer(Destination destination,
+                                                                           PersistentQueueDecision decision) {
+        String queueName = destination.queue();
+        QueueAttributes attributes = decision.attributes();
+        AmqpRelayConfig.PersistentQueueConfig config = decision.config();
+
+        CompletableFuture<Void> declaration = new CompletableFuture<>();
+        clientManager.ensureConnected()
+            .thenCompose(ignored -> clientManager.declareQueue(
+                queueName,
+                config.defaultDurable(),
+                config.defaultExclusive(),
+                config.defaultAutoDelete(),
+                attributes))
+            .whenComplete((ignored, err) -> {
+                if (err != null) {
+                    Throwable root = rootCause(err);
+                    if (isQueuePreconditionFailure(root)) {
+                        if (config.allowAttributeOverride()) {
+                            LOG.warnf(root,
+                                "Queue %s already exists with different attributes; continuing without re-declaration",
+                                queueName);
+                            declaration.complete(null);
+                        } else {
+                            LOG.errorf(root,
+                                "Queue %s attribute conflict detected and overrides are disabled", queueName);
+                            declaration.completeExceptionally(root);
+                        }
+                    } else {
+                        declaration.completeExceptionally(root);
+                    }
+                } else {
+                    LOG.debugf("Declared persistent queue %s (durable=%s, exclusive=%s, autoDelete=%s, attributes=%s)",
+                        queueName,
+                        config.defaultDurable(),
+                        config.defaultExclusive(),
+                        config.defaultAutoDelete(),
+                        attributes);
+                    declaration.complete(null);
+                }
+            });
+
+        return declaration
+            .thenCompose(ignored -> clientManager.createQueueConsumer(queueName))
+            .thenApply(consumer -> new ConsumerBinding(destination, consumer, null));
+    }
+
+    private record PersistentQueueDecision(boolean enabled,
+                                           QueueAttributes attributes,
+                                           AmqpRelayConfig.PersistentQueueConfig config) {
+
+        private PersistentQueueDecision {
+            attributes = attributes == null ? QueueAttributes.empty() : attributes;
+        }
+
+        static PersistentQueueDecision disabled() {
+            return new PersistentQueueDecision(false, QueueAttributes.empty(), null);
+        }
+    }
+
+    private boolean isQueuePreconditionFailure(Throwable throwable) {
+        if (throwable == null) {
+            return false;
+        }
+        String message = throwable.getMessage();
+        if (message == null) {
+            return false;
+        }
+        return message.contains("PRECONDITION_FAILED") || message.contains("precondition failed");
+    }
+
+    private Throwable rootCause(Throwable throwable) {
+        Throwable current = throwable;
+        while (current instanceof CompletionException || current instanceof ExecutionException) {
+            Throwable cause = current.getCause();
+            if (cause == null) {
+                break;
+            }
+            current = cause;
+        }
+        return current == null ? throwable : current;
+    }
+
     private boolean isShared(Source source) {
         if (source == null) {
             return false;
         }
 
-        // In Proton-J 0.34.1, the transport.Source class doesn't have
-        // getDistributionMode(), getCapabilities(), and getProperties() methods.
-        // These methods were added in later versions.
-        //
-        // For now, we'll use a simplified implementation that can be enhanced
-        // later based on actual requirements and testing with AMQP 1.0 clients.
+        AmqpRelayConfig.SharedDetectionConfig detectionConfig = relayConfig.sharedDetection();
+        if (detectionConfig == null || !detectionConfig.enabled()) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debugf("AMQP shared detection disabled (address=%s)", source.getAddress());
+            }
+            return false;
+        }
 
-        // TODO: Implement proper shared detection based on:
-        // 1. Upgrade to newer Proton-J version that supports these methods
-        // 2. Or use alternative approach like parsing link names or addresses
-        // 3. Or use Vert.x Proton's higher-level APIs if available
+        SharedDetectionStrategy strategy = detectionConfig.strategy();
+        boolean checkCapabilities = strategy == SharedDetectionStrategy.CAPABILITIES
+            || strategy == SharedDetectionStrategy.AUTO;
+        boolean checkAddress = strategy == SharedDetectionStrategy.ADDRESS_HINT
+            || strategy == SharedDetectionStrategy.AUTO;
 
-        return false; // Default to non-shared for now
+        boolean shared = false;
+        String detectionReason = null;
+
+        if (checkCapabilities) {
+            detectionReason = detectSharedByCapabilities(source, detectionConfig);
+            shared = detectionReason != null;
+        }
+
+        if (!shared && checkAddress) {
+            detectionReason = detectSharedByAddress(source, detectionConfig.addressHints());
+            shared = detectionReason != null;
+        }
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debugf("AMQP shared detection result address=%s shared=%s strategy=%s reason=%s",
+                source.getAddress(),
+                shared,
+                strategy,
+                detectionReason != null ? detectionReason : "no-match");
+        }
+
+        return shared;
+    }
+
+    private String detectSharedByCapabilities(Source source, AmqpRelayConfig.SharedDetectionConfig detectionConfig) {
+        Object distributionMode = tryInvoke(source, "getDistributionMode");
+        Set<String> distributionCandidates = normalizeToSet(detectionConfig.distributionModes());
+        if (distributionMode != null && !distributionCandidates.isEmpty()) {
+            String mode = distributionMode.toString().toLowerCase(Locale.ROOT);
+            if (distributionCandidates.contains(mode)) {
+                return "capabilities:distribution-mode=" + mode;
+            }
+        }
+
+        Object capabilities = tryInvoke(source, "getCapabilities");
+        Set<String> capabilitySymbols = normalizeToSet(detectionConfig.capabilitySymbols());
+        if (capabilities instanceof Object[] capabilityArray && !capabilitySymbols.isEmpty()) {
+            for (Object cap : capabilityArray) {
+                if (cap == null) {
+                    continue;
+                }
+                String capValue = cap.toString().toLowerCase(Locale.ROOT);
+                if (capabilitySymbols.contains(capValue)) {
+                    return "capabilities:symbol=" + capValue;
+                }
+            }
+        }
+
+        Object properties = tryInvoke(source, "getProperties");
+        if (properties instanceof Map<?, ?> propertyMap && !capabilitySymbols.isEmpty()) {
+            for (Map.Entry<?, ?> entry : propertyMap.entrySet()) {
+                Object key = entry.getKey();
+                Object value = entry.getValue();
+                if (key != null) {
+                    String keyValue = key.toString().toLowerCase(Locale.ROOT);
+                    if (capabilitySymbols.contains(keyValue)) {
+                        return "capabilities:property-key=" + keyValue;
+                    }
+                }
+                if (value != null) {
+                    String valueString = value.toString().toLowerCase(Locale.ROOT);
+                    if (capabilitySymbols.contains(valueString)) {
+                        return "capabilities:property-value=" + valueString;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private String detectSharedByAddress(Source source, List<String> hints) {
+        String address = source.getAddress();
+        if (address == null || address.isBlank()) {
+            return null;
+        }
+
+        String lowerAddress = address.toLowerCase(Locale.ROOT);
+        for (String hint : hints) {
+            if (hint == null) {
+                continue;
+            }
+            String normalized = hint.trim().toLowerCase(Locale.ROOT);
+            if (normalized.isEmpty()) {
+                continue;
+            }
+            if (lowerAddress.startsWith(normalized) || lowerAddress.contains(normalized)) {
+                return "address:hint=" + normalized;
+            }
+        }
+
+        return null;
+    }
+
+    private Object tryInvoke(Object target, String methodName) {
+        try {
+            Method method = target.getClass().getMethod(methodName);
+            if (!method.canAccess(target)) {
+                method.setAccessible(true);
+            }
+            return method.invoke(target);
+        } catch (NoSuchMethodException e) {
+            if (LOG.isTraceEnabled()) {
+                LOG.tracef("Method %s not available on %s", methodName, target.getClass());
+            }
+        } catch (IllegalAccessException | InvocationTargetException e) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debugf(e, "Failed to invoke %s on %s", methodName, target.getClass());
+            }
+        }
+        return null;
+    }
+
+    private Set<String> normalizeToSet(List<String> values) {
+        if (values == null || values.isEmpty()) {
+            return Set.of();
+        }
+
+        return values.stream()
+            .filter(Objects::nonNull)
+            .map(value -> value.trim().toLowerCase(Locale.ROOT))
+            .filter(value -> !value.isEmpty())
+            .collect(Collectors.toUnmodifiableSet());
     }
 
     private Destination resolveDestination(ProtonReceiver receiver, Message message) {
@@ -528,14 +773,7 @@ public class AmqpRelayEndpoint {
         return message == null ? root.getClass().getSimpleName() : message;
     }
 
-    private Throwable rootCause(Throwable err) {
-        Throwable current = err;
-        while (current.getCause() != null && current.getCause() != current) {
-            current = current.getCause();
-        }
-        return current;
-    }
-
+  
     private String buildExchangeAddress(String exchange, String routingKey) {
         if (exchange == null || exchange.isBlank()) {
             return null;

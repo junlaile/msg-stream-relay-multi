@@ -1,9 +1,11 @@
 package cn.junlaile.msg.stream.relay.multi.rabbit;
 
 import cn.junlaile.msg.stream.relay.multi.config.RabbitMQConfig;
+import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
+import io.vertx.core.json.JsonObject;
 import io.vertx.rabbitmq.RabbitMQClient;
 import io.vertx.rabbitmq.RabbitMQConsumer;
 import io.vertx.rabbitmq.RabbitMQOptions;
@@ -184,11 +186,42 @@ public class RabbitMQClientManager {
      * @return 异步操作结果，声明成功时完成
      * @throws NullPointerException 如果 queue 参数为 null
      */
-    public CompletionStage<Void> declareQueue(String queue, boolean durable, boolean exclusive, boolean autoDelete) {
+    public CompletionStage<Void> declareQueue(String queue,
+                                              boolean durable,
+                                              boolean exclusive,
+                                              boolean autoDelete) {
+        return declareQueue(queue, durable, exclusive, autoDelete, QueueAttributes.empty());
+    }
+
+    /**
+     * 声明一个带扩展属性的队列。
+     */
+    public CompletionStage<Void> declareQueue(String queue,
+                                              boolean durable,
+                                              boolean exclusive,
+                                              boolean autoDelete,
+                                              QueueAttributes attributes) {
         Objects.requireNonNull(queue, "queue");
-        return client.queueDeclare(queue, durable, exclusive, autoDelete)
-                .toCompletionStage()
-                .thenApply(json -> null);
+        QueueAttributes effectiveAttributes = attributes == null ? QueueAttributes.empty() : attributes;
+
+        Future<com.rabbitmq.client.AMQP.Queue.DeclareOk> future;
+        if (effectiveAttributes.isEmpty()) {
+            future = client.queueDeclare(queue, durable, exclusive, autoDelete);
+        } else {
+            future = client.queueDeclare(queue, durable, exclusive, autoDelete, effectiveAttributes.toArguments());
+        }
+
+        return future.toCompletionStage()
+            .thenCompose(declareOk -> CompletableFuture.<Void>completedFuture(null))
+            .whenComplete((ignored, err) -> {
+                if (err == null) {
+                    lastSuccessfulOperation.set(System.currentTimeMillis());
+                    LOG.debugf("Declared queue %s (durable=%s, exclusive=%s, autoDelete=%s, attributes=%s)",
+                        queue, durable, exclusive, autoDelete, effectiveAttributes);
+                } else {
+                    LOG.errorf(err, "Failed to declare queue: %s", queue);
+                }
+            });
     }
 
     /**

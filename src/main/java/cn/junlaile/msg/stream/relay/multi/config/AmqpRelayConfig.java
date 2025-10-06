@@ -1,9 +1,12 @@
 package cn.junlaile.msg.stream.relay.multi.config;
 
 import cn.junlaile.msg.stream.relay.multi.protocol.amqp.SemanticMode;
+import cn.junlaile.msg.stream.relay.multi.protocol.amqp.SharedDetectionStrategy;
 import io.smallrye.config.ConfigMapping;
 import io.smallrye.config.WithDefault;
 import io.smallrye.config.WithName;
+
+import java.util.List;
 
 /**
  * High level AMQP relay configuration controlling link semantics,
@@ -52,6 +55,9 @@ public interface AmqpRelayConfig {
     @WithDefault("60")
     int sharedIdleTtlSeconds();
 
+    @WithName("shared-detection")
+    SharedDetectionConfig sharedDetection();
+
     @WithName("flow.min-credit-threshold")
     @WithDefault("5")
     int flowMinCreditThreshold();
@@ -67,5 +73,57 @@ public interface AmqpRelayConfig {
     @WithName("flow.buffer-overflow-policy")
     @WithDefault("drop-oldest")
     String flowBufferOverflowPolicy();
-}
 
+    @WithName("persistent")
+    PersistentQueueConfig persistent();
+
+    interface SharedDetectionConfig {
+
+        @WithName("enabled")
+        @WithDefault("true")
+        boolean enabled();
+
+        @WithName("strategy")
+        @WithDefault("auto")
+        SharedDetectionStrategy strategy();
+
+        @WithName("address-hints")
+        @WithDefault("shared:,broadcast:,relay.shared:,amq.relay.shared")
+        List<String> addressHints();
+
+        @WithName("capability-symbols")
+        @WithDefault("queue-shared,shared,shared-subscription")
+        List<String> capabilitySymbols();
+
+        @WithName("distribution-modes")
+        @WithDefault("copy,shared")
+        List<String> distributionModes();
+    }
+
+    interface PersistentQueueConfig {
+
+        @WithName("enabled")
+        @WithDefault("true")
+        boolean enabled();
+
+        @WithName("name-patterns")
+        @WithDefault("*")
+        List<String> namePatterns();
+
+        @WithName("default-durable")
+        @WithDefault("true")
+        boolean defaultDurable();
+
+        @WithName("default-exclusive")
+        @WithDefault("false")
+        boolean defaultExclusive();
+
+        @WithName("default-auto-delete")
+        @WithDefault("false")
+        boolean defaultAutoDelete();
+
+        @WithName("allow-attribute-override")
+        @WithDefault("true")
+        boolean allowAttributeOverride();
+    }
+}
